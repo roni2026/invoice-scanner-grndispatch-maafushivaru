@@ -1,0 +1,581 @@
+{
+    "tesseract_cmd": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+    "app_settings": {
+        "ocr_engine": "tesseract",
+        "ocr_fallback_to_tesseract": true,
+        "extract_text_before_ocr": true,
+        "extraction_source": "auto",
+        "enhance_images": true,
+        "image_scale_factor": 5,
+        "ocr_psm": 11,
+        "ocr_oem": 3,
+        "fuzzy_match_threshold": 85,
+        "enable_multi_threading": true,
+        "max_threads": 4,
+        "archive_processed": false,
+        "move_failed_files": false,
+        "supplier_extraction_method": "receiving_report_field",
+        "processing_mode": "legacy",
+        "dry_run": false,
+        "desktop_notifications": true,
+        "auto_ingest_watcher": false,
+        "confidence_warn_threshold": 80,
+        "page_scan_region_enabled": false,
+        "page_scan_region_percent": 100,
+        "supplier_match_strategy": "combined",
+        "ocr_mode": "zone"
+    },
+    "folders": {
+        "base": ".",
+        "scanned": "SCANNED",
+        "processed": "PROCESSED",
+        "archive": "ARCHIVE",
+        "failed": "FAILED",
+        "logs": "LOGS"
+    },
+    "suppliers": [
+        "ADK GENERAL TRADING",
+        "ADK PHARMACEUTICAL SUPPLY",
+        "A&G ENERGY SOLUTIONS",
+        "AIRSEAFOODS GMBH",
+        "ALBA INTERNATIONAL",
+        "ALIHAVA CONSTRUCTION & TRADING CO PVT LTD",
+        "ALIA INVESTMENTS",
+        "ALLA INVEST",
+        "AMAGI EXPORTS",
+        "AMINATH SINAZ",
+        "ANAKEE",
+        "ARAABY PVT LTD",
+        "ARSEAFOODS GMBH",
+        "ASTERS",
+        "ASTRABON",
+        "ATOLL MARKET",
+        "ATOLLS PHARMACY",
+        "AYAAN EXPORT",
+        "BAAN THAKRAI",
+        "BARQUE INVESTMENT",
+        "BAZAAR TRADING",
+        "BESTBUY MALDIVES PVT LTD",
+        "BIGWIG",
+        "BIZ SOLUTIONS",
+        "BLENX PVT LTD",
+        "BLUE BIRD COMPANY",
+        "BROTHERHOOD SHOP",
+        "CGT PVT LTD",
+        "CAMBRO NILKAMAL",
+        "CHEF 2 CHEF LLC",
+        "CHEMCITY MALDIVES",
+        "CHEMLAB PRIVATE LTD",
+        "COLOR BANK",
+        "COLORLAND",
+        "COSMOPOLITAN",
+        "COSMERC MALDIVES",
+        "COUNTLINE",
+        "CSC ENGINEERING",
+        "D BLUE PRIVATE LTD",
+        "DIANA TRADING",
+        "DITECH CONSTRUCTION SOLUTIONS",
+        "DONAD INVESTMENT",
+        "EASTERN AND ALLIED SRI LANKA",
+        "ECOCOAST",
+        "EGO TIMBER",
+        "EMPARAL PVT LTD",
+        "EURO MARKETING PVT LTD",
+        "EVO SOLUTIONS",
+        "F&B EVENING STORE",
+        "FAITH PHARMACY",
+        "FANTASY PVT LTD",
+        "FEATHER INVESTMENT",
+        "FEEF SIDE CO.",
+        "FOOD SPECIALTY MALDIVES",
+        "FRELLA INTERNATIONAL",
+        "FRONTIER MARKETS ENTERPRISES PVT LTD",
+        "GGT",
+        "GLOBAL RIWA PVT LTD",
+        "GLOSSY HOME",
+        "GRAPE EXPECTATIONS PVT LTD",
+        "GREEN PATH PVT LTD",
+        "GUANGZHOU HENGYANG LIGHTING EQUIPMENT CO., LTD",
+        "H2O MALDIVES",
+        "HAMILTON INTERNATIONAL",
+        "HAPPY MARKET",
+        "HARDWARE LAB",
+        "HASSAN MARINE EQUIPMENT SHOP",
+        "HENMAN TRADING",
+        "HMHI COMPANY",
+        "HORIZON FISHERIES",
+        "HOSPITALITY LTD",
+        "HYDROGLOBAL PVT LTD",
+        "IFS GLOBAL PVT LTD",
+        "IKEBANA",
+        "ILAA MALDIVES PVT LTD",
+        "INNOVO MALDIVES",
+        "INTERNATIONAL FOOD SOLUTION PVT LTD",
+        "ISLAND BAZAAR",
+        "JIM TRADERS PVT LTD",
+        "JINAN RETEK INDUSTRIES INC",
+        "JVD TECHNOLOGIES",
+        "KAANGSHENG INDUSTRY",
+        "KAILAAN TRENDS",
+        "KEMIN EXPORTS",
+        "KIMIRICA HUNTER INTERNATIONAL",
+        "KOOLTEMP MALDIVES",
+        "L&R TRADING",
+        "LEO STORES PVT LTD",
+        "LILY ENTERPRISES PVT LTD",
+        "LILY INTERNATIONAL PVT LTD",
+        "LINK SERVE",
+        "LIVING WATER",
+        "LOLLO WHOLESALE",
+        "LOST SOUVENIRS",
+        "LOTUS FIHAARA",
+        "LYCORN MALDIVES",
+        "M-GLASS & ALUMINIUM",
+        "M7 PRINT",
+        "MAA HARDWARE",
+        "MACHINERY PART",
+        "MAM PETTY CASH",
+        "MARITIME & MERCANTILE INTERNATIONAL MV",
+        "MAZIYA TRADERS",
+        "MIAAF PVT LTD",
+        "MIYAMI TRADERS",
+        "MISRAAB",
+        "MMX TRADERS PVT LTD",
+        "MU STORE",
+        "NASREENA ABDULLA (FISH SUPPLIER)",
+        "NOREXOR AB",
+        "NOVELTY BOOKSHOP",
+        "OEVAALI ART SHOP",
+        "OLIVA EFFICIENT HOLDINGS",
+        "OMEGA FIBER & CHEMICALS",
+        "OSMOSIS ASIA",
+        "OSTRAVA PRIVATE LTD",
+        "PACIFIC TECHNOLOGIES",
+        "PALM TREE MARINE",
+        "PERSONAL COMPUTERS",
+        "POISE DISTRIBUTORS",
+        "POLL TABLE",
+        "PONY SPA",
+        "PREMIUM SUPPLIES",
+        "PRIME FERTILIZERS",
+        "PRINTLAB",
+        "PROCURE PLUS",
+        "PURE SHORES",
+        "PUREMIND TECHNOLOGY",
+        "RAINCO PVT LTD",
+        "REDSTAR",
+        "REF COOL",
+        "RESUINSA EXPERIENCES",
+        "REVOLUTION (HK) IMP & EXP CO. LTD",
+        "RMS MARINE SERVICE",
+        "ROGOWSKI TECHNOLOGY",
+        "ROOMNETTV",
+        "ROSEWARE CORPORATION",
+        "RUMBA",
+        "S&J SALES CORPORATION",
+        "SACH OVERSEAS",
+        "SAFCO INTERNATIONAL GEN TRD LLC",
+        "SALESCO PVT LTD",
+        "SAMAN TRADING",
+        "SAWHNEY FOOD STAFF TRADING CO.",
+        "SEAGEAR",
+        "SEAFOOD ENTERPRISES PVT LTD",
+        "SEALANDS PVT LTD",
+        "SEASPLASH MALDIVES",
+        "SERANDIB PVT LTD",
+        "SHENZHEN SANHE E-COMMERCE CO. LTD",
+        "SIMDI CONSUMER PRODUCTS",
+        "SIMDI TECH TECHNOLOGY",
+        "SONEE HARDWARE",
+        "SOVEREIGN AGENCIES PVT LTD",
+        "STANDARD & ORIGIN MARKETING",
+        "STEEL HARDWARE",
+        "SUN FRONT LIGHTING",
+        "SUPER POWER CO. LTD",
+        "SUPPLY GUIDE",
+        "T AND D WATER",
+        "TEMU",
+        "THANDIYA",
+        "THOOL",
+        "TIAN SHUAI FOOD",
+        "TOTAL BEVERAGES",
+        "TRADE MALDIVES PVT LTD",
+        "UNID HARDWARE",
+        "VB BROTHERS PVT LTD",
+        "VELIGAA HARDWARE",
+        "VILLA HAKATHA PVT LTD",
+        "VIRTUS GROUP GMBH",
+        "VISAKA TRADING",
+        "WANKUN (HANGZHOU) IMPORT AND EXPORT",
+        "WUHAN ZHAIKE NETWORK",
+        "XTAN GAVIN ELECTRONIC",
+        "YONKA PARIS",
+        "ZIP INVESTMENT PVT LTD"
+    ],
+    "aliases": {
+        "ADK GENERAL TRADING": [
+            "ADK GENERAL",
+            "ADK GRNERAL",
+            "ADK GENIRAL",
+            "ADK GENERAL TR",
+            "ADK GRNERAL TREDING"
+        ],
+        "ADK PHARMACEUTICAL SUPPLY": [
+            "ADK PHARMACEUTICAL",
+            "ADK PHARMACEL SUPPLY",
+            "ADK PHARMACEUTIC SUPPLY"
+        ],
+        "A&G ENERGY SOLUTIONS": [
+            "A&G ENERGY"
+        ],
+        "AIRSEAFOODS GMBH": [
+            "AIRSEAFOOD GMBH",
+            "ARSEAFOODS GMBH"
+        ],
+        "ALIHAVA CONSTRUCTION & TRADING CO PVT LTD": [
+            "ALIHAVA CONSTRUCTION",
+            "ALIHAVA CONSTRACTION",
+            "ALHAVA CONSTRUCTION",
+            "ALIHAVE CONDTRUCTION",
+            "ALHAVA CONSTRUCTION & TRADING CO PVT LTD"
+        ],
+        "ALIA INVESTMENTS": [
+            "ALIA INVESTMENT",
+            "ALLA INVEST"
+        ],
+        "ATOLL MARKET": [
+            "ATOLL"
+        ],
+        "ATOLLS PHARMACY": [
+            "ATOLLS PHARMAC",
+            "ATOLLS PHARMACHE"
+        ],
+        "BESTBUY MALDIVES PVT LTD": [
+            "BESTBUY",
+            "BESTBUY MALDIVES",
+            "BEST BUY MALDIVES"
+        ],
+        "BIGWIG": [
+            "BIGIWG",
+            "BIGWIG MALDIVES"
+        ],
+        "BIZ SOLUTIONS": [
+            "BIZ SOLUTIION LTD",
+            "BIZ SOLUTION"
+        ],
+        "BLENX PVT LTD": [
+            "BLENX",
+            "BLENX PV"
+        ],
+        "BROTHERHOOD SHOP": [
+            "BROTHERHOOD"
+        ],
+        "CHEF 2 CHEF LLC": [
+            "CHEF 2 CHEF",
+            "CHEF 2 CHEF LTD"
+        ],
+        "CHEMLAB PRIVATE LTD": [
+            "CHEMLAB PVT LTD",
+            "CHEMLAB PRIVATE LIMITED",
+            "CHEMLAB PRIVATE LIMITADE"
+        ],
+        "COLORLAND": [
+            "COLOR BANK"
+        ],
+        "COSMOPOLITAN": [
+            "COSMOPLLITA",
+            "COSMOPLITAN",
+            "COSMOPOLTON",
+            "COSMOPOLIT",
+            "COSMOPOLITA"
+        ],
+        "COSMERC MALDIVES": [
+            "COSMERC"
+        ],
+        "D BLUE PRIVATE LTD": [
+            "D BLUE PVT LTD"
+        ],
+        "DIANA TRADING": [
+            "DLANA TRADING",
+            "DHANA TRADING"
+        ],
+        "DITECH CONSTRUCTION SOLUTIONS": [
+            "DITECH CONSTRUCTION"
+        ],
+        "EASTERN AND ALLIED SRI LANKA": [
+            "EASTERN AND ALLIED SRILANKA",
+            "EASTERN AND ALLIED",
+            "EASTERN & ALLIED"
+        ],
+        "EMPARAL PVT LTD": [
+            "EMPARAL",
+            "EMAPARAL",
+            "EMAPARAL PVT LTD",
+            "EMPARAL MALDIVES"
+        ],
+        "EURO MARKETING PVT LTD": [
+            "EURO MARKETING",
+            "EURO MARK",
+            "EUTO MARKETING",
+            "EURO MARKETI FRIVET LIMITED",
+            "EURO MARKET PRIVATE LIMITADE",
+            "EURO MARKET PRIVATE LIMITED"
+        ],
+        "F&B EVENING STORE": [
+            "F&B EVENING",
+            "F& B EVENING STORE",
+            "F&B EVENING STGRE"
+        ],
+        "FANTASY PVT LTD": [
+            "FANTASY",
+            "FANTASY PVT.LTD"
+        ],
+        "FEATHER INVESTMENT": [
+            "FEATHER INVESTMENTS",
+            "FATHERS INVESTMENT"
+        ],
+        "FOOD SPECIALTY MALDIVES": [
+            "FOOD SPECIALTY",
+            "FOOD SPECIALITY",
+            "FOOD SPECIALITY MALDIVES",
+            "FOOD SPECIAL MALDIVES",
+            "FOODS MALDIVES"
+        ],
+        "FRELLA INTERNATIONAL": [
+            "FRELLA INTERNATIONAL PVT LTD"
+        ],
+        "FRONTIER MARKETS ENTERPRISES PVT LTD": [
+            "FRONTIER MARKETS",
+            "FRONTIER MARKET",
+            "FORONTIER MARKETS",
+            "FRONTIEER MARKETS",
+            "FRONTIRE MARKET INTERPRISE",
+            "FRONTIER MARKET INTERPRISE",
+            "FRONTIRE MARKETING"
+        ],
+        "GLOBAL RIWA PVT LTD": [
+            "GLOBAL RIWA",
+            "GLOVAL RIWA",
+            "GOLBAL RIWA"
+        ],
+        "GRAPE EXPECTATIONS PVT LTD": [
+            "GRAPE EXPECTATIONS",
+            "GRAPE EXPECTATION"
+        ],
+        "GREEN PATH PVT LTD": [
+            "GREEN PATH"
+        ],
+        "GUANGZHOU HENGYANG LIGHTING EQUIPMENT CO., LTD": [
+            "GUANGZHOU HENGYANG LIGHTING",
+            "GUANGZHOU HENGYANG"
+        ],
+        "HAPPY MARKET": [
+            "HAPPY MARKETS"
+        ],
+        "HMHI COMPANY": [
+            "HMHI COM LIMITED"
+        ],
+        "HORIZON FISHERIES": [
+            "HORIZON FISHIRES"
+        ],
+        "HYDROGLOBAL PVT LTD": [
+            "HYDRO GLOBAL",
+            "HYDRO GLOVAL"
+        ],
+        "IFS GLOBAL PVT LTD": [
+            "IFS GLOBAL"
+        ],
+        "ILAA MALDIVES PVT LTD": [
+            "ILLA MALDIVES PVT LTD",
+            "ILAA MALDIVES"
+        ],
+        "INNOVO MALDIVES": [
+            "INNOVO"
+        ],
+        "INTERNATIONAL FOOD SOLUTION PVT LTD": [
+            "INTERNATIONAL FOOD SOLUTION",
+            "INTERNATIONAL FOOD SOLUTIONS",
+            "INTERNATIONAL FOOD",
+            "INTERNATIONAL SOLUTION"
+        ],
+        "ISLAND BAZAAR": [
+            "ISLAND BAZAR"
+        ],
+        "JIM TRADERS PVT LTD": [
+            "JIM TRADERS",
+            "J.I.M TRADERS PVT LTD",
+            "J.I.M TRADERS"
+        ],
+        "KAILAAN TRENDS": [
+            "KAILAAN TRADERS",
+            "KAILLAN TRADERS",
+            "KAILLAN TRENDS",
+            "KAILLAN"
+        ],
+        "LEO STORES PVT LTD": [
+            "LEO STORES"
+        ],
+        "LILY ENTERPRISES PVT LTD": [
+            "LILY ENTERPRISES",
+            "LILY ENTERPRISE",
+            "LILY INTERPRISE"
+        ],
+        "LILY INTERNATIONAL PVT LTD": [
+            "LILY INTERNATIONAL"
+        ],
+        "LOLLO WHOLESALE": [
+            "LOLLO WHOLE SALE",
+            "LOLLO WHOLESLAE"
+        ],
+        "LOTUS FIHAARA": [
+            "LOTUS FIHARA",
+            "LOTUS FIHAAI",
+            "LOTUS FLL",
+            "LOTUS"
+        ],
+        "LYCORN MALDIVES": [
+            "LYCORN",
+            "LYCRN MALDIVES",
+            "LYCRON MALDIVES",
+            "LYCRON MALDEVES",
+            "LYCRON"
+        ],
+        "MAM PETTY CASH": [
+            "MAM PETTY CASH-MVR",
+            "MAM-PETTY CASH-MVR",
+            "MAM-PETTY CASH"
+        ],
+        "MARITIME & MERCANTILE INTERNATIONAL MV": [
+            "MARITIME & MERCANTILE",
+            "MARITIME&MERCANTILE INTERNATIONAL"
+        ],
+        "MIAAF PVT LTD": [
+            "MIAAF",
+            "MIAAF PVT"
+        ],
+        "MMX TRADERS PVT LTD": [
+            "MMX TRADERS"
+        ],
+        "NASREENA ABDULLA (FISH SUPPLIER)": [
+            "NASREENA ABDULLA",
+            "NASREEN ABDULLAH",
+            "NASREENA ABDULLAH"
+        ],
+        "OLIVA EFFICIENT HOLDINGS": [
+            "OLIVIA EFFICIENT HOLDINGS",
+            "OLIVA EFFICIENT HOLDINGS"
+        ],
+        "OMEGA FIBER & CHEMICALS": [
+            "OMIGA FIBER A CHEMICALES"
+        ],
+        "PERSONAL COMPUTERS": [
+            "PERSONAL COMPUTER"
+        ],
+        "PREMIUM SUPPLIES": [
+            "PREMIUM SUPPLY",
+            "PREMIUM SUPPLIER",
+            "PREMIUM SUPI",
+            "PREMIUM SUPPLER"
+        ],
+        "PROCURE PLUS": [
+            "PROCURE PLUS PVT LTD"
+        ],
+        "RESUINSA EXPERIENCES": [
+            "RESUINSA EXPERINCES"
+        ],
+        "RUMBA": [
+            "RUMBAA"
+        ],
+        "S&J SALES CORPORATION": [
+            "S&J SALES",
+            "S&J SSALES CORPOTATION",
+            "S&J SALES CORPOTATION"
+        ],
+        "SAFCO INTERNATIONAL GEN TRD LLC": [
+            "SAFCO INTERNATIONAL"
+        ],
+        "SALESCO PVT LTD": [
+            "SALESCO"
+        ],
+        "SAWHNEY FOOD STAFF TRADING CO.": [
+            "SAWHNEY FOODS",
+            "SAWHNEY FOOD STAFF",
+            "SAWHNEY",
+            "SAWHNER FOOD STAFF TRADING CO."
+        ],
+        "SEAFOOD ENTERPRISES PVT LTD": [
+            "SEAFOOD ENTERPRISES",
+            "SEAFOOD ENTERPRISE"
+        ],
+        "SEASPLASH MALDIVES": [
+            "SEASPLASH",
+            "SEAPLASH MALDIVES"
+        ],
+        "SHENZHEN SANHE E-COMMERCE CO. LTD": [
+            "SHENZHEN SANHE E COMMERCE CO. LTD",
+            "SHENZHEN SANHE ECOMMERCE"
+        ],
+        "SIMDI CONSUMER PRODUCTS": [
+            "SIMDI CONSUMER",
+            "SIMDI CONSUM PRODUCTS",
+            "SINDI CONSUMER",
+            "SUMDI CONSUME PRODUCT",
+            "SUMDI CONSUMER",
+            "SIDMI CONSUMER PRODUCTS",
+            "SIMDI RESU",
+            "SIMDI BEVERAGES"
+        ],
+        "SIMDI TECH TECHNOLOGY": [
+            "SIMDI TECH"
+        ],
+        "SOVEREIGN AGENCIES PVT LTD": [
+            "SOVEREIGN INTERNATIONAL PTE LTD"
+        ],
+        "STANDARD & ORIGIN MARKETING": [
+            "STANDARD & ORIGIN",
+            "STANDARD AND ORIGIN"
+        ],
+        "TOTAL BEVERAGES": [
+            "TOTAL BEVERAGE",
+            "TOTAL BEVERAGE PVT LTD"
+        ],
+        "TRADE MALDIVES PVT LTD": [
+            "TRADE MALDIVES"
+        ],
+        "VB BROTHERS PVT LTD": [
+            "VB BROTHERS"
+        ],
+        "VILLA HAKATHA PVT LTD": [
+            "VILLA HAKATHA",
+            "VILLA HAKATHA PRIVATE LIMITED",
+            "VILLA HAKATHA PRIVATE LIMITADE"
+        ],
+        "VIRTUS GROUP GMBH": [
+            "VIRTUS GROUP"
+        ],
+        "WANKUN (HANGZHOU) IMPORT AND EXPORT": [
+            "WANKUN (HANGZHOU)",
+            "WANKUN IMPORT & EXPORT"
+        ],
+        "ZIP INVESTMENT PVT LTD": [
+            "ZIP INVESTMENT",
+            "ZIP INVESTMENTS"
+        ]
+    },
+    "patterns": {
+        "grn_prefix": "RC-MAM-",
+        "grn_digits": 9,
+        "grn_min_digits": 4,
+        "grn_max_digits": 12,
+        "po_prefix": "MAM-",
+        "po_min_digits": 5
+    },
+    "ai_settings": {
+        "enabled": false,
+        "provider": "anthropic",
+        "model": "claude-haiku-4-5-20251001",
+        "api_key": "",
+        "custom_base_url": "",
+        "timeout_seconds": 20
+    }
+}
