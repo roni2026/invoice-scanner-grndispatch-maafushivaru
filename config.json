@@ -23,7 +23,9 @@
         "page_scan_region_enabled": false,
         "page_scan_region_percent": 100,
         "supplier_match_strategy": "combined",
-        "ocr_mode": "zone"
+        "ocr_mode": "zone",
+        "ocr_word_correction_enabled": false,
+        "smart_cross_match_enabled": false
     },
     "folders": {
         "base": ".",
@@ -82,7 +84,7 @@
         "EMPARAL PVT LTD",
         "EURO MARKETING PVT LTD",
         "EVO SOLUTIONS",
-        "F&B EVENING STORE",
+        "F&B EVENING STORE PVT LTD",
         "FAITH PHARMACY",
         "FANTASY PVT LTD",
         "FEATHER INVESTMENT",
@@ -571,11 +573,23 @@
         "po_min_digits": 5
     },
     "ai_settings": {
-        "enabled": false,
-        "provider": "anthropic",
-        "model": "claude-haiku-4-5-20251001",
+        "enabled": true,
+        "provider": "openai",
+        "model": "gpt-4o-mini",
         "api_key": "",
         "custom_base_url": "",
         "timeout_seconds": 20
+    },
+    "ocr_space": {
+        "api_key": "K88109865088957",
+        "language": "eng",
+        "isOverlayRequired": false,
+        "detectOrientation": true,
+        "scale": true,
+        "OCREngine": 2,
+        "isTable": false,
+        "filetype": "PDF",
+        "timeout_seconds": 30,
+        "max_upload_mb": 1.0
     }
 }

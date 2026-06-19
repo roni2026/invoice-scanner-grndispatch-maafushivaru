@@ -65,27 +65,6 @@ except ImportError:
     STATUS_DISCONNECTED = "disconnected"
     STATUS_LOW_CREDIT   = "low_credit"
     STATUS_OFFLINE      = "offline"
-# OCR word corrector
-try:
-    from ocr_word_corrector import correct_supplier_in_text, correct_invoice_number
-    OCR_CORRECTOR_AVAILABLE = True
-except ImportError:
-    OCR_CORRECTOR_AVAILABLE = False
-    def correct_supplier_in_text(text, suppliers, aliases):
-        return text, None
-    def correct_invoice_number(raw, supplier):
-        return raw
-
-# Smart cross-matcher
-try:
-    from smart_cross_matcher import infer_invoice_from_supplier, infer_supplier_from_invoice
-    CROSS_MATCHER_AVAILABLE = True
-except ImportError:
-    CROSS_MATCHER_AVAILABLE = False
-    def infer_invoice_from_supplier(raw, supplier):
-        return raw
-    def infer_supplier_from_invoice(text, suppliers, aliases):
-        return None, 0.0
 
 # ---------------------------------------------------------------------------
 # CONSTANTS / COLORS
@@ -240,36 +219,17 @@ _INVOICE_LABEL_PATS = [
 ]
 
 
-_INVOICE_STOP_WORDS = [
-    "DATE", "GRN", "RECEIVING", "SUPPLIER", "VENDOR", "PURCHASE ORDER",
-    "SUBTOTAL", "TOTAL", "AMOUNT", "QTY", "QUANTITY", "DESCRIPTION", "TAX",
-]
-
-
 def _find_invoice_value(raw: str) -> Optional[str]:
     for label_pat in _INVOICE_LABEL_PATS:
         lm = re.search(label_pat, raw)
         if not lm:
             continue
         rest = raw[lm.end(): lm.end() + 200]
-
-        # Cut off at the next line break, or the next field label found on
-        # the same line (so we don't swallow "DATE: ..." etc into the value)
-        cut_pos = len(rest)
-        nl_pos = rest.find("\n")
-        if nl_pos != -1:
-            cut_pos = min(cut_pos, nl_pos)
-        for sw in _INVOICE_STOP_WORDS:
-            m_sw = re.search(r"\b" + sw + r"\b", rest[:cut_pos])
-            if m_sw:
-                cut_pos = min(cut_pos, m_sw.start())
-
-        value = rest[:cut_pos]
-        # Collapse any double/triple spaces from OCR into single spaces,
-        # but keep the FULL value instead of stopping at the first token.
-        value = re.sub(r"\s+", " ", value).strip(" -:.")
-        if value and len(value) >= 2:
-            return value
+        tok = re.match(r"\s*(\S+)", rest)
+        if tok:
+            v = tok.group(1).strip("-:. ")
+            if v and len(v) >= 2:
+                return v
     return None
 
 
@@ -693,109 +653,6 @@ class OCRWorkerMixin:
             if name == main or name in lst:
                 return main
         return name
-    def _append_ai_log(self, message: str):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{ts}] {message}"
-        with self._ai_log_lock:
-            self._ai_log_lines.append(line)
-
-        logging.info(f"[AI-LOG] {message}")
-
-        if self._ai_log_text is not None:
-            try:
-                self.after(0, lambda l=line: self._append_ai_log_to_widget(l))
-            except Exception:
-                pass
-
-    def _append_ai_log_to_widget(self, line: str):
-        if self._ai_log_text is None:
-            return
-        self._ai_log_text.configure(state="normal")
-        self._ai_log_text.insert("end", line + "\n")
-        self._ai_log_text.see("end")
-        self._ai_log_text.configure(state="disabled")
-
-    def _open_ai_log_window(self):
-        if self._ai_log_window is not None and self._ai_log_window.winfo_exists():
-            self._ai_log_window.lift()
-            return
-
-        win = tk.Toplevel(self)
-        win.title("AI Supplier Matching Log")
-        win.geometry("980x620")
-        win.configure(bg=BG)
-
-        self._ai_log_window = win
-
-        top = tk.Frame(win, bg=PANEL2, height=46)
-        top.pack(fill=tk.X)
-        top.pack_propagate(False)
-
-        tk.Label(
-            top,
-            text="AI Supplier Matching Log",
-            bg=PANEL2,
-            fg=TEXT,
-            font=("Segoe UI", 11, "bold"),
-        ).pack(side=tk.LEFT, padx=14, pady=12)
-
-        btns = tk.Frame(top, bg=PANEL2)
-        btns.pack(side=tk.RIGHT, padx=10, pady=6)
-
-        ttk.Button(btns, text="Clear Log", command=self._clear_ai_log).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Refresh", command=self._refresh_ai_log_window).pack(side=tk.LEFT, padx=4)
-
-        body = tk.Frame(win, bg=BG)
-        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
-
-        txt = tk.Text(
-            body,
-            bg=PANEL,
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="flat",
-            wrap="word",
-            font=("Consolas", 9),
-        )
-        ys = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
-        xs = ttk.Scrollbar(body, orient="horizontal", command=txt.xview)
-        txt.configure(yscrollcommand=ys.set, xscrollcommand=xs.set, wrap="none")
-
-        txt.grid(row=0, column=0, sticky="nsew")
-        ys.grid(row=0, column=1, sticky="ns")
-        xs.grid(row=1, column=0, sticky="ew")
-        body.rowconfigure(0, weight=1)
-        body.columnconfigure(0, weight=1)
-
-        self._ai_log_text = txt
-        self._refresh_ai_log_window()
-
-        def _on_close():
-            self._ai_log_text = None
-            self._ai_log_window = None
-            win.destroy()
-
-        win.protocol("WM_DELETE_WINDOW", _on_close)
-
-    def _refresh_ai_log_window(self):
-        if self._ai_log_text is None:
-            return
-        self._ai_log_text.configure(state="normal")
-        self._ai_log_text.delete("1.0", "end")
-        with self._ai_log_lock:
-            for line in self._ai_log_lines:
-                self._ai_log_text.insert("end", line + "\n")
-        self._ai_log_text.see("end")
-        self._ai_log_text.configure(state="disabled")
-
-    def _clear_ai_log(self):
-        with self._ai_log_lock:
-            self._ai_log_lines.clear()
-        if self._ai_log_text is not None:
-            self._ai_log_text.configure(state="normal")
-            self._ai_log_text.delete("1.0", "end")
-            self._ai_log_text.configure(state="disabled")
-        self._append_ai_log("AI log cleared by user.")
 
     # ------------- SUPPLIER MATCHING WITH CONFIDENCE -------------
     def _match_supplier_with_confidence(self, text, filename="") -> Tuple[str, float]:
@@ -1746,19 +1603,16 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
             value=self.cfg.get("app_settings", {}).get("confidence_warn_threshold", 80)
         )
 
-        # AI supplier matcher + log store
+        # AI supplier matcher
         self._ai_matcher = None
-        self._ai_log_lines: List[str] = []
-        self._ai_log_lock = threading.Lock()
-        self._ai_log_window = None
-        self._ai_log_text = None
         if AI_MATCHER_AVAILABLE:
             try:
                 from ai_supplier_matcher import AISupplierMatcher
-                self._ai_matcher = AISupplierMatcher(self.cfg, logger_func=self._append_ai_log)
+                self._ai_matcher = AISupplierMatcher(self.cfg)
             except Exception as e:
                 logging.warning(f"AI matcher init failed: {e}")
         self._ai_status_var = tk.StringVar(value="")
+
         self._build_style()
         self._build_layout()
         self._refresh_engine_badge()
@@ -1780,90 +1634,63 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
         return cwd if cwd.exists() else scr
 
     def _load_config(self):
-        default = {
-            "folders": {
-                "base": ".",
-                "scanned": "SCANNED",
-                "processed": "PROCESSED",
-                "archive": "ARCHIVE",
-                "failed": "FAILED",
-                "logs": "LOGS"
-            },
-            "suppliers": [],
-            "aliases": {},
-            "patterns": {
-                "grn_prefix": "RC-MAM-",
-                "grn_digits": 9,
-                "grn_min_digits": 4,
-                "grn_max_digits": 12,
-                "po_prefix": "MAM-",
-                "po_min_digits": 5
-            },
-            "app_settings": {
-                "processing_mode": "custom",
-                "supplier_extraction_method": "both",
-                "dry_run": False,
-                "desktop_notifications": True,
-                "auto_ingest_watcher": False,
-                "confidence_warn_threshold": 80,
-                "page_scan_region_enabled": False,
-                "page_scan_region_percent": 100,
-                "supplier_match_strategy": "combined",
-                "ocr_mode": "zone",
-                "ocr_word_correction_enabled": False,
-                "smart_cross_match_enabled": False,
-                "ocr_engine": "tesseract",
-                "extract_text_before_ocr": True,
-                "enhance_images": True,
-                "ocr_fallback_to_tesseract": True,
-                "enable_multi_threading": True,
-                "max_threads": 4,
-                "fuzzy_match_threshold": 85,
-                "image_scale_factor": 2,
-                "extraction_source": "auto"
-            },
-            "ai_settings": {
-                "enabled": False,
-                "provider": "openai",
-                "model": "gpt-4o-mini",
-                "api_key": "",
-                "custom_base_url": "",
-                "timeout_seconds": 20
-            },
-            "ocr_space": {
-                "api_key": "K88109865088957",
-                "language": "eng",
-                "isOverlayRequired": False,
-                "detectOrientation": True,
-                "scale": True,
-                "OCREngine": 2,
-                "isTable": False,
-                "filetype": "PDF",
-                "timeout_seconds": 30,
-                "max_upload_mb": 1.0
-            }
-        }
-
         if not self.config_path.exists():
+            default = {
+                "tesseract_cmd": r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                "folders": {
+                    "base": ".", "scanned": "SCANNED", "processed": "PROCESSED",
+                    "archive": "ARCHIVE", "failed": "FAILED", "logs": "LOGS",
+                },
+                "suppliers": [],
+                "aliases": {},
+                "patterns": {
+                    "grn_prefix": "RC-MAM-", "grn_digits": 9,
+                    "grn_min_digits": 4, "grn_max_digits": 12,
+                    "po_prefix": "MAM-", "po_min_digits": 5,
+                },
+                "app_settings": {
+                    "ocr_engine": "tesseract", "ocr_fallback_to_tesseract": True,
+                    "extract_text_before_ocr": True, "enhance_images": True,
+                    "image_scale_factor": 2, "ocr_psm": 6, "ocr_oem": 3,
+                    "fuzzy_match_threshold": 85, "enable_multi_threading": True,
+                    "max_threads": 4, "archive_processed": False,
+                    "move_failed_files": False, "supplier_extraction_method": "both",
+                    "processing_mode": "legacy", "dry_run": False,
+                    "desktop_notifications": True,
+                    "auto_ingest_watcher": False,
+                    "confidence_warn_threshold": 80,
+                },
+            }
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(default, f, indent=4)
             return default
-
-        try:
-            with open(self.config_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        except Exception as e:
-            logging.warning(f"Config load failed, using defaults: {e}")
-            return default
-
-        for key, value in default.items():
-            if key not in cfg:
-                cfg[key] = value
-            elif isinstance(value, dict):
-                for subkey, subvalue in value.items():
-                    if subkey not in cfg[key]:
-                        cfg[key][subkey] = subvalue
-
+        with open(self.config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        s = cfg.setdefault("app_settings", {})
+        s.setdefault("processing_mode", "legacy")
+        s.setdefault("supplier_extraction_method", "both")
+        s.setdefault("dry_run", False)
+        s.setdefault("desktop_notifications", True)
+        s.setdefault("auto_ingest_watcher", False)
+        s.setdefault("confidence_warn_threshold", 80)
+        s.setdefault("page_scan_region_enabled", False)
+        s.setdefault("page_scan_region_percent", 100)
+        cfg.setdefault("patterns", {
+            "grn_prefix": "RC-MAM-", "grn_digits": 9,
+            "grn_min_digits": 4, "grn_max_digits": 12,
+            "po_prefix": "MAM-", "po_min_digits": 5,
+        })
+        s.setdefault("supplier_match_strategy", "combined")
+        s.setdefault("ocr_mode", "full")   # "full" or "zone"
+        cfg.setdefault("ai_settings", {
+            "enabled": False,
+            "provider": "anthropic",
+            "model": "claude-haiku-4-5-20251001",
+            "api_key": "",
+            "custom_base_url": "",
+            "timeout_seconds": 20,
+        })
         return cfg
-
 
     def _save_config(self):
         with open(self.config_path, "w", encoding="utf-8") as f:
@@ -2157,12 +1984,6 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
             add_scan_tab(self)
         except Exception as e:
             logging.error(f"Scan tab failed to load: {e}")
-        try:
-            from aiextracttab import add_ai_extract_tab
-            add_ai_extract_tab(self)
-        except Exception as e:
-            logging.error(f"AI Extract tab failed to load: {e}", exc_info=True)
-            messagebox.showerror("AI Extract Tab Load Error", str(e))
 
         self._process_buttons = [
             getattr(self, "_btn_start_rename",   None),
@@ -2812,335 +2633,6 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
                      font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=16)
             if key != "tesseract":
                 ttk.Button(row, text="How to install", command=lambda k=key: self._install_engine(k)).pack(side=tk.RIGHT)
-        # ── Supplier Match Strategy ──────────────────────────────────────
-        smb = self._section(
-            frame,
-            "Supplier Match Strategy",
-            subtitle="Algorithm used to identify the supplier name from extracted text",
-        )
-        self._supplier_strategy_var = tk.StringVar(
-            value=self.cfg.get("app_settings", {}).get("supplier_match_strategy", "combined")
-        )
-        smb_inner = tk.Frame(smb, bg=PANEL)
-        smb_inner.pack(fill=tk.X, padx=20, pady=(0, 12))
-
-        if SUPPLIER_MATCHER_AVAILABLE:
-            for val, lbl in STRATEGY_LABELS.items():
-                ttk.Radiobutton(
-                    smb_inner, text=lbl, value=val,
-                    variable=self._supplier_strategy_var,
-                    command=self._on_supplier_strategy_changed,
-                    style="TRadiobutton",
-                ).pack(anchor="w", pady=3)
-        else:
-            tk.Label(
-                smb_inner,
-                text="⚠  supplier_matcher.py not found — place it in the same folder as maafushivaru_hub.py",
-                bg=PANEL, fg=WARNING, font=("Segoe UI", 9),
-            ).pack(anchor="w", pady=(0, 8))
-
-        # ── AI Supplier Match ─────────────────────────────────────────────
-        aib = self._section(
-            frame,
-            "AI Supplier Matching",
-            subtitle="Use a cloud AI (Claude, GPT, Gemini) to identify suppliers",
-        )
-        ai_inner = tk.Frame(aib, bg=PANEL)
-        ai_inner.pack(fill=tk.X, padx=20, pady=(0, 12))
-
-        if not AI_MATCHER_AVAILABLE:
-            tk.Label(
-                ai_inner,
-                text="⚠  ai_supplier_matcher.py not found — place it in the same folder as maafushivaru_hub.py",
-                bg=PANEL,
-                fg=WARNING,
-                font=("Segoe UI", 9),
-            ).pack(anchor="w", pady=(0, 8))
-        else:
-            tk.Label(
-                ai_inner,
-                text="AI supplier module loaded successfully. OCR.space is available as the default API OCR backend.",
-                bg=PANEL,
-                fg=SUCCESS,
-                font=("Segoe UI", 9),
-            ).pack(anchor="w", pady=(0, 8))
-
-        ai_cfg = self.cfg.get("ai_settings", {})
-
-        self._ai_enabled_var = tk.BooleanVar(value=bool(ai_cfg.get("enabled", False)))
-        ttk.Checkbutton(
-            ai_inner,
-            text="Enable AI supplier matching (falls back to rule-based if AI fails)",
-            variable=self._ai_enabled_var,
-            command=self._on_ai_enabled_toggle,
-            style="TCheckbutton",
-        ).pack(anchor="w", pady=(0, 8))
-
-        prow = tk.Frame(ai_inner, bg=PANEL)
-        prow.pack(fill=tk.X, pady=3)
-        tk.Label(
-            prow,
-            text="Provider:",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 9, "bold"),
-            width=16,
-            anchor="w",
-        ).pack(side=tk.LEFT)
-
-        self._ai_provider_var = tk.StringVar(value=ai_cfg.get("provider", "openai"))
-        provider_names = {k: v["label"] for k, v in PROVIDERS.items()} if PROVIDERS else {
-            "openai": "OpenAI GPT",
-            "custom": "Custom / Local",
-        }
-
-        for val, lbl in provider_names.items():
-            ttk.Radiobutton(
-                prow,
-                text=lbl,
-                value=val,
-                variable=self._ai_provider_var,
-                command=self._on_ai_provider_changed,
-                style="TRadiobutton",
-            ).pack(side=tk.LEFT, padx=(0, 14))
-
-        mrow = tk.Frame(ai_inner, bg=PANEL)
-        mrow.pack(fill=tk.X, pady=3)
-        tk.Label(
-            mrow,
-            text="Model:",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 9, "bold"),
-            width=16,
-            anchor="w",
-        ).pack(side=tk.LEFT)
-
-        self._ai_model_var = tk.StringVar(value=ai_cfg.get("model", "gpt-4o-mini"))
-        self._ai_model_entry = tk.Entry(
-            mrow,
-            textvariable=self._ai_model_var,
-            bg=PANEL2,
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="flat",
-            font=("Segoe UI", 10),
-            bd=0,
-            highlightthickness=1,
-            highlightbackground=PANEL3,
-            highlightcolor=ACCENT,
-            width=36,
-        )
-        self._ai_model_entry.pack(side=tk.LEFT, ipady=4)
-
-        krow = tk.Frame(ai_inner, bg=PANEL)
-        krow.pack(fill=tk.X, pady=3)
-        tk.Label(
-            krow,
-            text="API Key:",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 9, "bold"),
-            width=16,
-            anchor="w",
-        ).pack(side=tk.LEFT)
-
-        self._ai_key_var = tk.StringVar(value=ai_cfg.get("api_key", ""))
-        tk.Entry(
-            krow,
-            textvariable=self._ai_key_var,
-            bg=PANEL2,
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="flat",
-            font=("Segoe UI", 10),
-            bd=0,
-            highlightthickness=1,
-            highlightbackground=PANEL3,
-            highlightcolor=ACCENT,
-            show="*",
-            width=52,
-        ).pack(side=tk.LEFT, ipady=4)
-
-        urow = tk.Frame(ai_inner, bg=PANEL)
-        urow.pack(fill=tk.X, pady=3)
-        tk.Label(
-            urow,
-            text="Custom URL:",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 9, "bold"),
-            width=16,
-            anchor="w",
-        ).pack(side=tk.LEFT)
-
-        self._ai_url_var = tk.StringVar(value=ai_cfg.get("custom_base_url", ""))
-        tk.Entry(
-            urow,
-            textvariable=self._ai_url_var,
-            bg=PANEL2,
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="flat",
-            font=("Segoe UI", 10),
-            bd=0,
-            highlightthickness=1,
-            highlightbackground=PANEL3,
-            highlightcolor=ACCENT,
-            width=52,
-        ).pack(side=tk.LEFT, ipady=4)
-
-        tk.Label(
-            urow,
-            text="  (for Custom/Local only)",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 8),
-        ).pack(side=tk.LEFT, padx=6)
-
-        trow = tk.Frame(ai_inner, bg=PANEL)
-        trow.pack(fill=tk.X, pady=3)
-        tk.Label(
-            trow,
-            text="Timeout (sec):",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 9, "bold"),
-            width=16,
-            anchor="w",
-        ).pack(side=tk.LEFT)
-
-        self._ai_timeout_var = tk.IntVar(value=int(ai_cfg.get("timeout_seconds", 20)))
-        ttk.Spinbox(
-            trow,
-            from_=5,
-            to=120,
-            textvariable=self._ai_timeout_var,
-            width=6,
-            font=("Segoe UI", 10),
-        ).pack(side=tk.LEFT)
-
-        ocr_space_cfg = self.cfg.get("ocr_space", {})
-
-        okrow = tk.Frame(ai_inner, bg=PANEL)
-        okrow.pack(fill=tk.X, pady=3)
-        tk.Label(
-            okrow,
-            text="OCR.space Key:",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 9, "bold"),
-            width=16,
-            anchor="w",
-        ).pack(side=tk.LEFT)
-
-        self._ocr_space_key_var = tk.StringVar(value=ocr_space_cfg.get("api_key", "K88109865088957"))
-        tk.Entry(
-            okrow,
-            textvariable=self._ocr_space_key_var,
-            bg=PANEL2,
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="flat",
-            font=("Segoe UI", 10),
-            bd=0,
-            highlightthickness=1,
-            highlightbackground=PANEL3,
-            highlightcolor=ACCENT,
-            show="*",
-            width=52,
-        ).pack(side=tk.LEFT, ipady=4)
-
-        oerow = tk.Frame(ai_inner, bg=PANEL)
-        oerow.pack(fill=tk.X, pady=3)
-        tk.Label(
-            oerow,
-            text="OCR.space Engine:",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 9, "bold"),
-            width=16,
-            anchor="w",
-        ).pack(side=tk.LEFT)
-
-        self._ocr_space_engine_var = tk.IntVar(value=int(ocr_space_cfg.get("OCREngine", 2)))
-        for eng_num in (1, 2, 3):
-            ttk.Radiobutton(
-                oerow,
-                text=str(eng_num),
-                value=eng_num,
-                variable=self._ocr_space_engine_var,
-                style="TRadiobutton",
-            ).pack(side=tk.LEFT, padx=(0, 14))
-
-        srow = tk.Frame(ai_inner, bg=PANEL)
-        srow.pack(fill=tk.X, pady=3)
-        tk.Label(
-            srow,
-            text="Max Upload:",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 9, "bold"),
-            width=16,
-            anchor="w",
-        ).pack(side=tk.LEFT)
-
-        self._ocr_space_max_mb_var = tk.StringVar(value=str(ocr_space_cfg.get("max_upload_mb", 1.0)))
-        tk.Entry(
-            srow,
-            textvariable=self._ocr_space_max_mb_var,
-            bg=PANEL2,
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="flat",
-            font=("Segoe UI", 10),
-            bd=0,
-            highlightthickness=1,
-            highlightbackground=PANEL3,
-            highlightcolor=ACCENT,
-            width=8,
-        ).pack(side=tk.LEFT, ipady=4)
-
-        tk.Label(
-            srow,
-            text="MB  (OCR upload will be compressed below this limit; recommended 1.0)",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 8),
-        ).pack(side=tk.LEFT, padx=8)
-
-        strow = tk.Frame(ai_inner, bg=PANEL)
-        strow.pack(fill=tk.X, pady=(8, 0))
-
-        self._ai_status_lbl = tk.Label(
-            strow,
-            textvariable=self._ai_status_var,
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 9),
-        )
-        self._ai_status_lbl.pack(side=tk.LEFT, padx=(0, 12))
-
-        ttk.Button(
-            strow,
-            text="🔌  Test Connection",
-            command=self._test_ai_connection,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-
-        ttk.Button(
-            strow,
-            text="📜  View AI Log",
-            command=self._open_ai_log_window,
-        ).pack(side=tk.LEFT)
-
-        tk.Label(
-            ai_inner,
-            text="API keys are stored in config.json. Keep that file secure and out of version control.",
-            bg=PANEL,
-            fg=ERROR,
-            font=("Segoe UI", 8),
-            wraplength=850,
-        ).pack(anchor="w", pady=(6, 0))
 
         # Processing parameters
         sb = self._section(frame, "Processing Parameters")
@@ -3182,77 +2674,6 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
         ]):
             tk.Label(g, text=lbl, bg=PANEL, fg=TEXT, font=("Segoe UI", 10), width=34, anchor="w").grid(row=r, column=0, sticky="w", pady=6)
             ttk.Spinbox(g, from_=lo, to=hi, textvariable=var, width=8, font=("Segoe UI", 10)).grid(row=r, column=1, sticky="w", padx=8)
-
-        # ── OCR Word Correction ───────────────────────────────────────────
-        ocr_corr_box = self._section(
-            frame,
-            "OCR Word Correction",
-            subtitle="Fixes broken OCR words by fuzzy-matching against known supplier names",
-        )
-        ocr_corr_inner = tk.Frame(ocr_corr_box, bg=PANEL)
-        ocr_corr_inner.pack(fill=tk.X, padx=20, pady=(0, 12))
-
-        self._ocr_word_correction_var = tk.BooleanVar(
-            value=self.cfg.get("app_settings", {}).get("ocr_word_correction_enabled", False)
-        )
-        ttk.Checkbutton(
-            ocr_corr_inner,
-            text="Enable OCR Word Correction — fix garbled supplier words (e.g. EASRN → EASTERN)",
-            variable=self._ocr_word_correction_var,
-            style="TCheckbutton",
-        ).pack(anchor="w", pady=4)
-        tk.Label(
-            ocr_corr_inner,
-            text=(
-                "Allows 1–2 wrong characters per word (longer words allow slightly more).\n"
-                "Turn OFF if you get false supplier matches. Requires ocr_word_corrector.py."
-            ),
-            bg=PANEL, fg=MUTED, font=("Segoe UI", 9), wraplength=850, justify="left",
-        ).pack(anchor="w", pady=(0, 4))
-
-        if not OCR_CORRECTOR_AVAILABLE:
-            tk.Label(
-                ocr_corr_inner,
-                text="⚠  ocr_word_corrector.py not found in the application folder.",
-                bg=PANEL, fg=WARNING, font=("Segoe UI", 9),
-            ).pack(anchor="w")
-
-        # ── Smart Cross-Matching ──────────────────────────────────────────
-        xcm_box = self._section(
-            frame,
-            "Smart Supplier ↔ Invoice Cross-Matching",
-            subtitle="Infer supplier from invoice format, and vice versa",
-        )
-        xcm_inner = tk.Frame(xcm_box, bg=PANEL)
-        xcm_inner.pack(fill=tk.X, padx=20, pady=(0, 12))
-
-        self._smart_cross_match_var = tk.BooleanVar(
-            value=self.cfg.get("app_settings", {}).get("smart_cross_match_enabled", False)
-        )
-        ttk.Checkbutton(
-            xcm_inner,
-            text="Enable Smart Cross-Matching — identify supplier from invoice number pattern, and vice versa",
-            variable=self._smart_cross_match_var,
-            style="TCheckbutton",
-        ).pack(anchor="w", pady=4)
-        tk.Label(
-            xcm_inner,
-            text=(
-                "When enabled:\n"
-                "  • If the supplier is found, the invoice number is cleaned using that supplier's known format.\n"
-                "  • If the supplier is NOT found, the invoice number pattern is used to identify the supplier.\n"
-                "  • When OFF: the system works exactly as before — no cross-matching.\n"
-                "Edit SUPPLIER_INVOICE_XREF in smart_cross_matcher.py to add your invoice formats."
-            ),
-            bg=PANEL, fg=MUTED, font=("Segoe UI", 9), wraplength=850, justify="left",
-        ).pack(anchor="w", pady=(0, 4))
-
-        if not CROSS_MATCHER_AVAILABLE:
-            tk.Label(
-                xcm_inner,
-                text="⚠  smart_cross_matcher.py not found in the application folder.",
-                bg=PANEL, fg=WARNING, font=("Segoe UI", 9),
-            ).pack(anchor="w")
 
         # Base path
         pb = self._section(frame, "Base Folder Path")
@@ -3329,8 +2750,8 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
             editable_cols={0, 1},
             pre_edit_fn=None,
         )
-
-        # Supplier tree column 0 is editable, not preview-only
+		
+        # Also bind column 0 explicitly since it is not a preview column here
         self._sup_tree._edit_on_preview_cb = None
 
         # Wire up live search against the supplier tree
@@ -3895,74 +3316,33 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
 
     def _apply_settings(self):
         s = self.cfg.setdefault("app_settings", {})
-        s["ocr_engine"] = self._engine_var.get()
-        s["extract_text_before_ocr"] = bool(self._extract_text_var.get())
-        s["extraction_source"] = self._extraction_source_var.get()
-        s["enhance_images"] = bool(self._enhance_var.get())
-        s["ocr_fallback_to_tesseract"] = bool(self._fallback_var.get())
-        s["enable_multi_threading"] = bool(self._threads_var.get())
-        s["max_threads"] = int(self._max_threads_var.get())
-        s["fuzzy_match_threshold"] = int(self._threshold_var.get())
-        s["image_scale_factor"] = int(self._scale_var.get())
-        s["processing_mode"] = self._processing_mode_var.get()
-        s["dry_run"] = bool(self._dry_run_var.get())
-        s["desktop_notifications"] = bool(self._notify_var.get())
-        s["auto_ingest_watcher"] = bool(self._watcher_var.get())
-        s["confidence_warn_threshold"] = int(self._conf_threshold_var.get())
-        s["page_scan_region_enabled"] = bool(self._page_scan_enabled_var.get())
-        s["page_scan_region_percent"] = int(self._page_scan_percent_var.get())
+        s["ocr_engine"]                 = self._engine_var.get()
+        s["extract_text_before_ocr"]    = bool(self._extract_text_var.get())
+        s["extraction_source"]          = self._extraction_source_var.get()
+        s["enhance_images"]             = bool(self._enhance_var.get())
+        s["ocr_fallback_to_tesseract"]  = bool(self._fallback_var.get())
+        s["enable_multi_threading"]     = bool(self._threads_var.get())
+        s["max_threads"]                = int(self._max_threads_var.get())
+        s["fuzzy_match_threshold"]      = int(self._threshold_var.get())
+        s["image_scale_factor"]         = int(self._scale_var.get())
+        s["processing_mode"]            = self._processing_mode_var.get()
+        s["dry_run"]                    = bool(self._dry_run_var.get())
+        s["desktop_notifications"]      = bool(self._notify_var.get())
+        s["auto_ingest_watcher"]        = bool(self._watcher_var.get())
+        s["confidence_warn_threshold"]  = int(self._conf_threshold_var.get())
+        s["page_scan_region_enabled"]   = bool(self._page_scan_enabled_var.get())
+        s["page_scan_region_percent"]   = int(self._page_scan_percent_var.get())
         s["ocr_mode"] = self._ocr_mode_var.get()
-        s["supplier_extraction_method"] = self._supplier_method_var.get()
-        s["ocr_word_correction_enabled"] = bool(self._ocr_word_correction_var.get())
-        s["smart_cross_match_enabled"] = bool(self._smart_cross_match_var.get())
-
-        if hasattr(self, "_supplier_strategy_var"):
-            s["supplier_match_strategy"] = self._supplier_strategy_var.get()
-
         if hasattr(self, "_ocr_mode_info_var"):
             self._ocr_mode_info_var.set(self._ocr_mode_label(s["ocr_mode"]))
-
+        s["supplier_extraction_method"] = self._supplier_method_var.get()
         self.cfg.setdefault("folders", {})["base"] = self._base_var.get()
-
-        ai = self.cfg.setdefault("ai_settings", {})
-        ai["enabled"] = bool(self._ai_enabled_var.get())
-        ai["provider"] = self._ai_provider_var.get()
-        ai["model"] = self._ai_model_var.get().strip()
-        ai["api_key"] = self._ai_key_var.get().strip()
-        ai["custom_base_url"] = self._ai_url_var.get().strip()
-        ai["timeout_seconds"] = int(self._ai_timeout_var.get())
-
-        ocr_space = self.cfg.setdefault("ocr_space", {})
-        ocr_space["api_key"] = self._ocr_space_key_var.get().strip() or "K88109865088957"
-        ocr_space["language"] = "eng"
-        ocr_space["isOverlayRequired"] = False
-        ocr_space["detectOrientation"] = True
-        ocr_space["scale"] = True
-        ocr_space["OCREngine"] = int(self._ocr_space_engine_var.get())
-        ocr_space["isTable"] = False
-        ocr_space["filetype"] = "PDF"
-        ocr_space["timeout_seconds"] = 30
-        try:
-            ocr_space["max_upload_mb"] = float(self._ocr_space_max_mb_var.get())
-        except Exception:
-            ocr_space["max_upload_mb"] = 1.0
-
         self._save_config()
         self.dirs = self._resolve_dirs()
         self._ensure_dirs()
         self._configure_tesseract()
         self._refresh_engine_badge()
         self._refresh_dashboard_stats()
-
-        if AI_MATCHER_AVAILABLE:
-            try:
-                from ai_supplier_matcher import AISupplierMatcher
-                self._ai_matcher = AISupplierMatcher(self.cfg, logger_func=self._append_ai_log)
-                self._append_ai_log("AI matcher reloaded with latest settings.")
-            except Exception as e:
-                logging.warning(f"AI matcher reload failed: {e}")
-                self._append_ai_log(f"AI matcher reload failed: {e}")
-
         messagebox.showinfo("Settings Saved", "All settings saved successfully.")
 
     def _reload_settings(self):
@@ -4018,99 +3398,6 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
             "OCR Mode set to ZONE (fast header scan)." if mode == "zone"
             else "OCR Mode set to FULL PAGE."
         )
-
-    def _on_supplier_strategy_changed(self):
-        strategy = self._supplier_strategy_var.get()
-        self.cfg.setdefault("app_settings", {})["supplier_match_strategy"] = strategy
-        self._save_config()
-        self._set_status(f"Supplier match strategy set to: {STRATEGY_LABELS.get(strategy, strategy)}")
-
-    def _on_ai_enabled_toggle(self):
-        val = bool(self._ai_enabled_var.get())
-        self.cfg.setdefault("ai_settings", {})["enabled"] = val
-        self._save_config()
-        self._set_status("AI matching: ON" if val else "AI matching: OFF")
-
-    def _on_ai_provider_changed(self):
-        provider = self._ai_provider_var.get()
-        self.cfg.setdefault("ai_settings", {})["provider"] = provider
-        # Auto-fill default model for selected provider
-        if PROVIDERS and provider in PROVIDERS:
-            default_model = PROVIDERS[provider].get("default_model", "")
-            self._ai_model_var.set(default_model)
-            self.cfg["ai_settings"]["model"] = default_model
-        self._save_config()
-
-    def _test_ai_connection(self):
-        self._ai_status_var.set("Testing connection...")
-        self._append_ai_log("Starting AI/OCR connection test...")
-
-        if not AI_MATCHER_AVAILABLE or self._ai_matcher is None:
-            self._ai_status_var.set("ai_supplier_matcher.py not available")
-            self._append_ai_log("ai_supplier_matcher.py not available.")
-            return
-
-        def _run():
-            try:
-                self.cfg.setdefault("ai_settings", {}).update({
-                    "enabled": bool(self._ai_enabled_var.get()),
-                    "provider": self._ai_provider_var.get(),
-                    "model": self._ai_model_var.get(),
-                    "api_key": self._ai_key_var.get().strip(),
-                    "custom_base_url": self._ai_url_var.get().strip(),
-                    "timeout_seconds": int(self._ai_timeout_var.get()),
-                })
-
-                self.cfg.setdefault("ocr_space", {}).update({
-                    "api_key": self._ocr_space_key_var.get().strip() or "K88109865088957",
-                    "OCREngine": int(self._ocr_space_engine_var.get()),
-                    "language": "eng",
-                    "isOverlayRequired": False,
-                    "detectOrientation": True,
-                    "scale": True,
-                    "isTable": False,
-                    "filetype": "PDF",
-                    "timeout_seconds": 30,
-                })
-
-                try:
-                    max_mb = float(self._ocr_space_max_mb_var.get() or 1.0)
-                except Exception:
-                    max_mb = 1.0
-
-                self.cfg["ocr_space"]["max_upload_mb"] = max_mb
-
-                from ai_supplier_matcher import AISupplierMatcher
-                self._ai_matcher = AISupplierMatcher(self.cfg, logger_func=self._append_ai_log)
-                status_code, message = self._ai_matcher.test_connection()
-
-            except Exception as e:
-                status_code = STATUS_DISCONNECTED
-                message = str(e)
-
-            color_map = {
-                STATUS_CONNECTED: SUCCESS,
-                STATUS_DISCONNECTED: ERROR,
-                STATUS_LOW_CREDIT: WARNING,
-                STATUS_OFFLINE: MUTED,
-            }
-
-            color = color_map.get(status_code, MUTED)
-
-            dot_map = {
-                STATUS_CONNECTED: "●",
-                STATUS_DISCONNECTED: "✗",
-                STATUS_LOW_CREDIT: "⚠",
-                STATUS_OFFLINE: "○",
-            }
-
-            dot = dot_map.get(status_code, "○")
-
-            self._append_ai_log(f"Connection test result: {status_code} | {message}")
-            self.after(0, lambda: self._ai_status_var.set(f"{dot}  {message}"))
-            self.after(0, lambda: self._ai_status_lbl.configure(fg=color))
-
-        threading.Thread(target=_run, daemon=True).start()
 
     # ------------------------------------------------------------------
     # DESKTOP NOTIFICATION HELPER (INSTANCE)
@@ -4908,114 +4195,61 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
     # ------------------------------------------------------------------
     def _extract_core_fields_for_file(self, pdf_path: str, mode: str) -> Dict:
         text = self._extract_text(pdf_path)
-        if len((text or "").strip()) < 40:
-            ai_ocr_text = self._extract_text_via_ai_ocrspace(pdf_path)
-            if ai_ocr_text:
-                text = ai_ocr_text
-
-        rr = self._extract_receiving_report_fields(pdf_path)
+        rr   = self._extract_receiving_report_fields(pdf_path)
 
         supplier = None
         invoice_for_filename = ""
         invoice_for_dispatch = ""
         confidence = 0.0
 
-        app_s = self.cfg.get("app_settings", {})
-        ocr_correction_on  = app_s.get("ocr_word_correction_enabled", False)
-        cross_match_on     = app_s.get("smart_cross_match_enabled", False)
-        suppliers_list     = self.cfg.get("suppliers", [])
-        aliases_map        = self.cfg.get("aliases", {})
+        if mode == "legacy":
+            cands, aliases = self._legacy_load_suppliers()
+            legacy_text = self._legacy_extract_text(pdf_path)
+            supplier = self._legacy_extract_supplier(legacy_text, cands, aliases) or "UNKNOWN SUPPLIER"
+            invoice_for_filename = self._extract_invoice_old(legacy_text) or "NO-INVOICE"
+            invoice_for_dispatch = self._extract_invoice_old(legacy_text) or ""
+            confidence = 70.0 if supplier != "UNKNOWN SUPPLIER" else 0.0
 
-        # ── Step 0: OCR Word Correction (optional) ────────────────────────
-        working_text = text
-        if ocr_correction_on and OCR_CORRECTOR_AVAILABLE:
-            corrected, ocr_detected_supplier = correct_supplier_in_text(
-                text, suppliers_list, aliases_map
-            )
-            if ocr_detected_supplier:
-                working_text = corrected
-                supplier     = ocr_detected_supplier
-                confidence   = 78.0
-                logging.info(f"[OCR-CORR] OCR word correction matched supplier: {supplier}")
-
-        # ── Step 1: Normal supplier extraction ───────────────────────────
-        if not supplier:
-            if mode == "legacy":
-                cands, aliases = self._legacy_load_suppliers()
-                legacy_text    = self._legacy_extract_text(pdf_path)
-                supplier       = self._legacy_extract_supplier(legacy_text, cands, aliases) or "UNKNOWN SUPPLIER"
-                invoice_for_filename = self._extract_invoice_old(legacy_text) or "NO-INVOICE"
-                invoice_for_dispatch = self._extract_invoice_old(legacy_text) or ""
-                confidence = 70.0 if supplier != "UNKNOWN SUPPLIER" else 0.0
-
-            elif mode == "mixed":
-                method = app_s.get("supplier_extraction_method", "both")
-                if method in ("receiving_report_field", "both"):
-                    supplier = self._extract_supplier_from_field(working_text)
-                    if supplier: confidence = 85.0
-                if not supplier and method in ("header_company_name", "both"):
-                    supplier = self._extract_company_from_invoice_pages(pdf_path)
-                    if supplier: confidence = 80.0
-                if not supplier:
-                    supplier, confidence = self._match_supplier_with_confidence(working_text, os.path.basename(pdf_path))
-                if not supplier or supplier == "UNKNOWN SUPPLIER":
-                    supplier   = _get_last_good_supplier() or "UNKNOWN SUPPLIER"
-                    confidence = 0.0
-                else:
-                    _set_last_good_supplier(supplier)
-                legacy_text = self._legacy_extract_text(pdf_path)
-                invoice_for_filename = self._extract_invoice_old(legacy_text) or "NO-INVOICE"
-                invoice_for_dispatch = self._extract_invoice_old(legacy_text) or ""
-
-            else:  # custom
-                method = app_s.get("supplier_extraction_method", "both")
-                if method in ("receiving_report_field", "both"):
-                    supplier = self._extract_supplier_from_field(working_text)
-                    if supplier: confidence = 85.0
-                if not supplier and method in ("header_company_name", "both"):
-                    supplier = self._extract_company_from_invoice_pages(pdf_path)
-                    if supplier: confidence = 80.0
-                if not supplier:
-                    supplier, confidence = self._match_supplier_with_confidence(working_text, os.path.basename(pdf_path))
-                if not supplier or supplier == "UNKNOWN SUPPLIER":
-                    supplier   = _get_last_good_supplier() or "UNKNOWN SUPPLIER"
-                    confidence = 0.0
-                else:
-                    _set_last_good_supplier(supplier)
-                invoice_for_filename = self._extract_invoice(working_text, supplier_hint=supplier) or "NO-INVOICE"
-                invoice_for_dispatch = self._extract_invoice_old(working_text) or ""
-
-        # Extract invoices for legacy mode if OCR correction found supplier early
-        if mode == "legacy" and supplier != "UNKNOWN SUPPLIER" and not invoice_for_filename:
+        elif mode == "mixed":
+            method = self.cfg.get("app_settings", {}).get("supplier_extraction_method", "both")
+            if method in ("receiving_report_field", "both"):
+                supplier = self._extract_supplier_from_field(text)
+                if supplier:
+                    confidence = 85.0
+            if not supplier and method in ("header_company_name", "both"):
+                supplier = self._extract_company_from_invoice_pages(pdf_path)
+                if supplier:
+                    confidence = 80.0
+            if not supplier:
+                supplier, confidence = self._match_supplier_with_confidence(text, os.path.basename(pdf_path))
+            if not supplier or supplier == "UNKNOWN SUPPLIER":
+                supplier   = _get_last_good_supplier() or "UNKNOWN SUPPLIER"
+                confidence = 0.0
+            else:
+                _set_last_good_supplier(supplier)
             legacy_text = self._legacy_extract_text(pdf_path)
             invoice_for_filename = self._extract_invoice_old(legacy_text) or "NO-INVOICE"
             invoice_for_dispatch = self._extract_invoice_old(legacy_text) or ""
 
-        # ── Step 2: Smart Cross-Matching (optional) ───────────────────────
-        if cross_match_on and CROSS_MATCHER_AVAILABLE:
-            # Feature B: if supplier still unknown, try to ID from invoice pattern
-            if (not supplier or supplier == "UNKNOWN SUPPLIER") and (invoice_for_dispatch or invoice_for_filename):
-                invoice_probe = invoice_for_dispatch or invoice_for_filename
-                inferred_sup, inferred_conf = infer_supplier_from_invoice(
-                    working_text + " " + invoice_probe,
-                    suppliers_list,
-                    aliases_map,
-                )
-                if inferred_sup and inferred_conf > 0:
-                    supplier   = inferred_sup
-                    confidence = inferred_conf
-                    logging.info(f"[CROSS-MATCH] Invoice pattern → supplier: {supplier} ({confidence:.0f}%)")
-                    _set_last_good_supplier(supplier)
-
-            # Feature A: if supplier is now known, clean the invoice number
-            if supplier and supplier != "UNKNOWN SUPPLIER":
-                raw_inv = invoice_for_filename if invoice_for_filename not in ("NO-INVOICE", "") else invoice_for_dispatch
-                if raw_inv and raw_inv != "NO-INVOICE":
-                    cleaned_inv = infer_invoice_from_supplier(raw_inv, supplier)
-                    if cleaned_inv != raw_inv:
-                        logging.info(f"[CROSS-MATCH] Invoice corrected: {raw_inv} → {cleaned_inv}")
-                    invoice_for_filename = cleaned_inv or "NO-INVOICE"
-                    invoice_for_dispatch = cleaned_inv or ""
+        else:  # custom
+            method = self.cfg.get("app_settings", {}).get("supplier_extraction_method", "both")
+            if method in ("receiving_report_field", "both"):
+                supplier = self._extract_supplier_from_field(text)
+                if supplier:
+                    confidence = 85.0
+            if not supplier and method in ("header_company_name", "both"):
+                supplier = self._extract_company_from_invoice_pages(pdf_path)
+                if supplier:
+                    confidence = 80.0
+            if not supplier:
+                supplier, confidence = self._match_supplier_with_confidence(text, os.path.basename(pdf_path))
+            if not supplier or supplier == "UNKNOWN SUPPLIER":
+                supplier   = _get_last_good_supplier() or "UNKNOWN SUPPLIER"
+                confidence = 0.0
+            else:
+                _set_last_good_supplier(supplier)
+            invoice_for_filename = self._extract_invoice(text, supplier_hint=supplier) or "NO-INVOICE"
+            invoice_for_dispatch = self._extract_invoice_old(text) or ""
 
         grn    = rr.get("grn", "") or self._extract_grn_full(pdf_path, text) or "RC-MAM-0000"
         po     = rr.get("po",  "") or "MAM-0000"
@@ -5234,27 +4468,6 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
                 self.after(0, self._refresh_dashboard_stats)
 
         threading.Thread(target=worker, daemon=True).start()
-
-    def _extract_text_via_ai_ocrspace(self, pdf_path: str) -> str:
-        """
-        Optional OCR.space extraction path.
-        Uses OCR.space if available and configured.
-        Returns upper-cased text or empty string on failure.
-        """
-        if not AI_MATCHER_AVAILABLE or self._ai_matcher is None:
-            return ""
-
-        try:
-            self._append_ai_log(f"Trying OCR.space extraction for: {os.path.basename(pdf_path)}")
-            text, err = self._ai_matcher.extract_text(file_path=pdf_path)
-            if err:
-                self._append_ai_log(f"OCR.space error: {err}")
-                return ""
-            self._append_ai_log(f"OCR.space extraction success: {len(text)} chars")
-            return (text or "").upper()
-        except Exception as e:
-            self._append_ai_log(f"OCR.space extraction exception: {e}")
-            return ""
 
     # ------------------------------------------------------------------
     # LINK HELPERS
@@ -5550,5 +4763,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

@@ -1,0 +1,1493 @@
+# aiextracttab.py
+# AI Extract Tab for Maafushivaru Hub
+# - Trims PDFs to only Receiving Report pages (RC-MAM + PO number)
+# - Saves trimmed copies into "TEMP API PDFS" with the SAME filename
+# - OCRs each trimmed PDF via OCR.space API
+# - Extracts supplier / GRN / invoice / totals using main app helpers
+# - "Send to Tabs" pushes results into Rename + Dispatch tabs and renames originals
+
+import os
+import re
+import json
+import queue
+import shutil
+import logging
+import threading
+import io
+from datetime import datetime
+from typing import List, Dict
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+import fitz  # PyMuPDF
+
+from maafushivaru_hub import (
+    PANEL,
+    PANEL2,
+    TEXT,
+    MUTED,
+    ACCENT,
+    SUCCESS,
+    WARNING,
+    ERROR,
+)
+
+try:
+    from ai_supplier_matcher import OCRSpaceExtractor
+    OCR_SPACE_AVAILABLE = True
+except ImportError:
+    OCR_SPACE_AVAILABLE = False
+    OCRSpaceExtractor = None
+
+
+# ---------------------------------------------------------------------------
+# PAGE DETECTION: is this page a Receiving Report?
+# ---------------------------------------------------------------------------
+_RC_MAM_PAT = re.compile(r"RC[-\s]*MAM[-\s]*\d{3,}", re.IGNORECASE)
+_PO_NUM_PAT = re.compile(
+    r"(?:PURCHASE\s*ORDER|P\.?\s*O\.?)\s*(?:NO\.?|NUMBER|#)?\s*[:\-]?\s*(?:MAM[-\s]?)?\d{3,}",
+    re.IGNORECASE,
+)
+
+
+def _page_is_receiving_report(page_text: str) -> bool:
+    if not page_text:
+        return False
+    u = page_text.upper()
+    has_rc = bool(_RC_MAM_PAT.search(u))
+    has_po = bool(_PO_NUM_PAT.search(u))
+    has_record_label = "RECEIVING RECORD" in u or "RECEIVING REPORT" in u
+    return (has_rc and has_po) or (has_record_label and has_po)
+
+# ---------------------------------------------------------------------------
+# OCR.SPACE USAGE / CREDIT TRACKING  (1 request = 1 page, 2500 free / month)
+# ---------------------------------------------------------------------------
+_OCR_FREE_MONTHLY_QUOTA = 2500
+
+
+def _aix_usage_file_path(app) -> str:
+    return os.path.join(app.dirs.get("base", "."), "ocr_usage.json")
+
+
+def _aix_load_usage(app) -> dict:
+    path = _aix_usage_file_path(app)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _aix_save_usage(app, data: dict):
+    path = _aix_usage_file_path(app)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logging.warning(f"[AI EXTRACT] Could not save usage file: {e}")
+
+
+def _aix_current_month_key() -> str:
+    return datetime.now().strftime("%Y-%m")
+
+
+def _aix_add_usage_pages(app, n_pages: int):
+    if n_pages <= 0:
+        return
+    data = _aix_load_usage(app)
+    key = _aix_current_month_key()
+    data[key] = int(data.get(key, 0)) + int(n_pages)
+    _aix_save_usage(app, data)
+    _aix_refresh_usage_label(app)
+
+
+def _aix_get_usage_this_month(app) -> int:
+    data = _aix_load_usage(app)
+    return int(data.get(_aix_current_month_key(), 0))
+
+
+def _aix_refresh_usage_label(app):
+    used = _aix_get_usage_this_month(app)
+    remaining = max(_OCR_FREE_MONTHLY_QUOTA - used, 0)
+    text = f"OCR.space credits — used: {used} / {_OCR_FREE_MONTHLY_QUOTA}   remaining: {remaining}"
+    color = SUCCESS
+    if remaining <= 0:
+        color = ERROR
+    elif remaining <= 250:
+        color = WARNING
+    if hasattr(app, "_aix_usage_var"):
+        app._aix_usage_var.set(text)
+    if hasattr(app, "_aix_usage_lbl"):
+        try:
+            app._aix_usage_lbl.configure(fg=color)
+        except Exception:
+            pass
+
+
+def _aix_set_api_status(app, text: str, color=None):
+    """Live 'what is the API doing right now' indicator."""
+    if color is None:
+        color = ACCENT
+    if hasattr(app, "_aix_api_status_var"):
+        app.after(0, lambda: app._aix_api_status_var.set(text))
+    if hasattr(app, "_aix_api_status_lbl"):
+        app.after(0, lambda: app._aix_api_status_lbl.configure(fg=color))
+# ---------------------------------------------------------------------------
+# PDF SIZE COMPRESSION (target < 1 MB so OCR.space free tier accepts it)
+# ---------------------------------------------------------------------------
+def _aix_compress_pdf_to_size(src_path: str, dest_path: str, target_mb: float = 1.0) -> bool:
+    """
+    Copies/compresses src_path -> dest_path so the result is <= target_mb.
+    Returns True if compression was actually needed/applied.
+    Returns False if the file was already small enough (plain copy).
+    """
+    from PIL import Image
+
+    target_bytes = target_mb * 1024 * 1024
+    src_size = os.path.getsize(src_path)
+
+    if src_size <= target_bytes:
+        shutil.copy2(src_path, dest_path)
+        return False
+
+    # --- Pass 1: lossless cleanup (strip junk, recompress streams) ---
+    try:
+        doc = fitz.open(src_path)
+        doc.save(dest_path, garbage=4, deflate=True, deflate_images=True, clean=True)
+        doc.close()
+    except Exception as e:
+        logging.warning(f"[AI EXTRACT] lossless compress failed [{src_path}]: {e}")
+        shutil.copy2(src_path, dest_path)
+
+    if os.path.getsize(dest_path) <= target_bytes:
+        return True
+
+    # --- Pass 2: rasterize pages at decreasing quality until under target ---
+    for scale, quality in [(1.6, 75), (1.3, 65), (1.0, 55), (0.8, 45), (0.6, 35)]:
+        try:
+            doc = fitz.open(src_path)
+            out = fitz.open()
+            for page in doc:
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=quality)
+                jpeg_bytes = buf.getvalue()
+
+                rect = page.rect
+                new_page = out.new_page(width=rect.width, height=rect.height)
+                new_page.insert_image(rect, stream=jpeg_bytes)
+
+            out.save(dest_path, garbage=4, deflate=True)
+            out.close()
+            doc.close()
+        except Exception as e:
+            logging.error(f"[AI EXTRACT] rasterize compress failed [{src_path}] @ scale {scale}: {e}")
+            continue
+
+        if os.path.getsize(dest_path) <= target_bytes:
+            break
+
+    return True
+
+# ---------------------------------------------------------------------------
+# TAB BUILDER
+# ---------------------------------------------------------------------------
+def add_ai_extract_tab(app):
+    app._aix_results = []
+    app._aix_row_map = {}
+    app._aix_all_rows = []
+    app._aix_queue = queue.Queue()
+    app._aix_running = False
+    app._aix_temp_folder = os.path.join(app.dirs.get("base", "."), "TEMP API PDFS")
+    app._aix_compress_log = []       # stores trim/compress step messages
+
+    frame = app._make_tab("AI Extract")
+    frame.configure(style="TFrame")
+
+    ctrl_bar = tk.Frame(frame, bg=PANEL2, height=52)
+    ctrl_bar.pack(fill=tk.X)
+    ctrl_bar.pack_propagate(False)
+
+    app._aix_btn_scan = ttk.Button(
+        ctrl_bar,
+        text="✂  Scan & Trim PDFs",
+        style="Accent.TButton",
+        command=lambda: _aix_start_scan_trim(app),
+    )
+    app._aix_btn_scan.pack(side=tk.LEFT, padx=(16, 6), pady=8)
+
+    app._aix_btn_process = ttk.Button(
+        ctrl_bar,
+        text="🤖  Process (OCR.space API)",
+        style="Success.TButton",
+        command=lambda: _aix_start_process(app),
+    )
+    app._aix_btn_process.pack(side=tk.LEFT, padx=4, pady=8)
+
+    app._aix_btn_send = ttk.Button(
+        ctrl_bar,
+        text="📤  Send to Tabs",
+        command=lambda: _aix_send_to_tabs(app),
+    )
+    app._aix_btn_send.pack(side=tk.LEFT, padx=4, pady=8)
+
+    ttk.Button(
+        ctrl_bar,
+        text="🗑  Clear",
+        command=lambda: _aix_clear(app),
+    ).pack(side=tk.LEFT, padx=4, pady=8)
+
+    ttk.Button(
+        ctrl_bar,
+        text="📂  Open TEMP Folder",
+        command=lambda: app._open_folder(app._aix_temp_folder),
+    ).pack(side=tk.LEFT, padx=4, pady=8)
+
+    # --- Compress Log button ---
+    app._aix_btn_compress_log = ttk.Button(
+        ctrl_bar,
+        text="📋  Compress Log",
+        command=lambda: _aix_show_compress_log(app),
+    )
+    app._aix_btn_compress_log.pack(side=tk.LEFT, padx=4, pady=8)
+
+    # --- Debug button ---
+    ttk.Button(
+        ctrl_bar,
+        text="🔧  Debug OCR",
+        command=lambda: _aix_open_debug_window(app),
+    ).pack(side=tk.LEFT, padx=4, pady=8)
+    
+    # --- OCR.space engine selector ---
+    tk.Label(
+        ctrl_bar,
+        text="OCR Engine:",
+        bg=PANEL2,
+        fg=TEXT,
+        font=("Segoe UI", 9),
+    ).pack(side=tk.LEFT, padx=(12, 2), pady=8)
+
+    _ocr_engine_options = [
+        "Engine 1 (Default)",
+        "Engine 2 (Enhanced)",
+        "Engine 3 (Extra Accurate)",
+    ]
+    app._aix_ocr_engine_var = tk.StringVar(value=_ocr_engine_options[1])  # default Engine 2
+
+    # Pre-select based on what's in config
+    _cfg_engine = app.cfg.get("ocr_space", {}).get("OCREngine", 2)
+    if _cfg_engine == 1:
+        app._aix_ocr_engine_var.set(_ocr_engine_options[0])
+    elif _cfg_engine == 3:
+        app._aix_ocr_engine_var.set(_ocr_engine_options[2])
+    else:
+        app._aix_ocr_engine_var.set(_ocr_engine_options[1])
+
+    app._aix_ocr_engine_combo = ttk.Combobox(
+        ctrl_bar,
+        textvariable=app._aix_ocr_engine_var,
+        values=_ocr_engine_options,
+        state="readonly",
+        width=22,
+    )
+    app._aix_ocr_engine_combo.pack(side=tk.LEFT, padx=(0, 8), pady=8)
+
+    # --- Status badge ---
+    badge_text  = "OCR.space: ready"   if OCR_SPACE_AVAILABLE else "OCR.space: MISSING"
+    badge_color = SUCCESS              if OCR_SPACE_AVAILABLE else ERROR
+    tk.Label(
+        ctrl_bar,
+        text=badge_text,
+        bg=PANEL2,
+        fg=badge_color,
+        font=("Segoe UI", 9, "bold"),
+    ).pack(side=tk.RIGHT, padx=16, pady=8)
+
+    prog_bar = tk.Frame(frame, bg=PANEL, height=6)
+    prog_bar.pack(fill=tk.X)
+    app._aix_progress = ttk.Progressbar(prog_bar, orient="horizontal", mode="determinate")
+    app._aix_progress.pack(fill=tk.X)
+    # --- Live API status + usage/credit bar ---
+    status_bar2 = tk.Frame(frame, bg=PANEL, height=28)
+    status_bar2.pack(fill=tk.X)
+    status_bar2.pack_propagate(False)
+
+    app._aix_api_status_var = tk.StringVar(value="API status: idle")
+    app._aix_api_status_lbl = tk.Label(
+        status_bar2,
+        textvariable=app._aix_api_status_var,
+        bg=PANEL,
+        fg=MUTED,
+        font=("Segoe UI", 9, "bold"),
+    )
+    app._aix_api_status_lbl.pack(side=tk.LEFT, padx=16, pady=4)
+
+    app._aix_usage_var = tk.StringVar(value="OCR.space credits — loading...")
+    app._aix_usage_lbl = tk.Label(
+        status_bar2,
+        textvariable=app._aix_usage_var,
+        bg=PANEL,
+        fg=MUTED,
+        font=("Segoe UI", 9, "bold"),
+    )
+    app._aix_usage_lbl.pack(side=tk.RIGHT, padx=16, pady=4)
+
+    hdr_bar = tk.Frame(frame, bg=PANEL)
+    hdr_bar.pack(fill=tk.X)
+    tk.Label(
+        hdr_bar,
+        text="AI Extract Results",
+        bg=PANEL,
+        fg=TEXT,
+        font=("Segoe UI", 11, "bold"),
+    ).pack(side=tk.LEFT, padx=20, pady=(12, 4))
+    tk.Label(
+        hdr_bar,
+        text="1) Scan & Trim  ->  2) Process (OCR.space API)  ->  3) Send to Tabs  ·  Double-click a cell to edit",
+        bg=PANEL,
+        fg=MUTED,
+        font=("Segoe UI", 8),
+    ).pack(side=tk.LEFT, padx=8, pady=(12, 4))
+
+    tf = tk.Frame(frame, bg=PANEL)
+    tf.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
+
+    cols = ("File", "Date", "Supplier", "Confidence", "PO #", "Invoice #",
+            "USD", "MVR", "EUR", "GBP", "SGD", "GRN")
+    cw = {
+        "File": 190, "Date": 90, "Supplier": 200, "Confidence": 80,
+        "PO #": 115, "Invoice #": 130, "USD": 85, "MVR": 85,
+        "EUR": 85, "GBP": 85, "SGD": 85, "GRN": 220,
+    }
+
+    app._aix_tree = ttk.Treeview(tf, columns=cols, show="headings", height=20)
+    for c in cols:
+        app._aix_tree.heading(c, text=c, anchor="center")
+        app._aix_tree.column(c, width=cw.get(c, 100), anchor="center", stretch=False)
+
+    ys = ttk.Scrollbar(tf, orient="vertical", command=app._aix_tree.yview)
+    xs = ttk.Scrollbar(tf, orient="horizontal", command=app._aix_tree.xview)
+    app._aix_tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+
+    app._aix_tree.grid(row=0, column=0, sticky="nsew")
+    ys.grid(row=0, column=1, sticky="ns")
+    xs.grid(row=1, column=0, sticky="ew")
+    tf.rowconfigure(0, weight=1)
+    tf.columnconfigure(0, weight=1)
+
+    app._bind_tree_mousewheel(app._aix_tree)
+
+    app._make_tree_editable(
+        app._aix_tree,
+        on_edit_callback=lambda r, ci, ov, nv: _aix_on_tree_edit(app, r, ci, ov, nv),
+        editable_cols=set(range(1, 12)),
+    )
+    app._aix_tree._edit_on_preview_cb = lambda row_id: _aix_preview(app, row_id)
+    _aix_refresh_usage_label(app)
+
+# ---------------------------------------------------------------------------
+# PREVIEW
+# ---------------------------------------------------------------------------
+def _aix_preview(app, row_id: str):
+    result = app._aix_row_map.get(row_id, {})
+    path = result.get("temp_path", "")
+    if not path or not os.path.exists(path):
+        path = result.get("raw_path", "")
+    app._show_pdf_preview(path)
+
+
+# ---------------------------------------------------------------------------
+# STEP 1: SCAN & TRIM
+# ---------------------------------------------------------------------------
+def _aix_start_scan_trim(app):
+    if app._aix_running:
+        return
+
+    app._aix_running = True
+    app._set_buttons_state("disabled")
+    app._set_status("AI Extract: scanning & trimming PDFs...", ACCENT)
+
+    def worker():
+        kept = 0
+        skipped = 0
+        app._aix_compress_log.clear()
+        app._aix_compress_log.append(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Compress/Trim session started."
+        )
+        try:
+            scanned = app.dirs.get("scanned")
+            temp = app._aix_temp_folder
+            os.makedirs(temp, exist_ok=True)
+
+            files = app._get_pdf_files_strict_order(scanned)
+            total = len(files)
+
+            if total == 0:
+                app._set_status("SCANNED folder is empty - nothing to trim.", WARNING)
+                return
+
+            app.after(0, lambda: app._aix_progress.configure(maximum=max(total, 1), value=0))
+
+            for idx, src in enumerate(files, 1):
+                fname = os.path.basename(src)
+                app._set_status(f"[AI EXTRACT] Trimming {fname} ({idx}/{total})", ACCENT)
+
+                keep_indices = _aix_find_receiving_pages(app, src)
+
+                if not keep_indices:
+                    skipped += 1
+                    skip_msg = (
+                        f"[{datetime.now().strftime('%H:%M:%S')}]  SKIPPED: {fname} "
+                        f"— no receiving-report pages found."
+                    )
+                    app._aix_compress_log.append(skip_msg)
+                    logging.info(f"[AI EXTRACT] No receiving pages found in {fname} - skipped.")
+                    app._aix_queue.put(("progress", idx))
+                    continue
+
+                dest = os.path.join(temp, fname)
+                try:
+                    src_size_kb  = os.path.getsize(src)  / 1024
+                    _aix_write_trimmed_pdf(src, keep_indices, dest)
+                    dest_size_kb = os.path.getsize(dest) / 1024
+                    ratio        = (1 - dest_size_kb / src_size_kb) * 100 if src_size_kb > 0 else 0
+                    kept += 1
+
+                    log_msg = (
+                        f"[{datetime.now().strftime('%H:%M:%S')}]  {fname}\n"
+                        f"   Pages kept  : {len(keep_indices)} of {keep_indices}\n"
+                        f"   Original    : {src_size_kb:,.1f} KB\n"
+                        f"   Trimmed     : {dest_size_kb:,.1f} KB\n"
+                        f"   Reduction   : {ratio:.1f}%\n"
+                        f"   Saved to    : {dest}\n"
+                    )
+                    app._aix_compress_log.append(log_msg)
+                except Exception as e:
+                    skipped += 1
+                    err_msg = (
+                        f"[{datetime.now().strftime('%H:%M:%S')}]  ERROR trimming {fname}: {e}"
+                    )
+                    app._aix_compress_log.append(err_msg)
+                    logging.error(f"[AI EXTRACT] Trim failed [{fname}]: {e}", exc_info=True)
+
+                app._aix_queue.put(("progress", idx))
+
+            summary = (
+                f"[{datetime.now().strftime('%H:%M:%S')}]  Session complete. "
+                f"Kept: {kept}   Skipped: {skipped}"
+            )
+            app._aix_compress_log.append(summary)
+            app._set_status(
+                f"Trim complete - {kept} file(s) saved to TEMP API PDFS, {skipped} skipped.",
+                SUCCESS if skipped == 0 else WARNING,
+            )
+
+        except Exception as e:
+            logging.error(f"[AI EXTRACT] Scan/trim error: {e}", exc_info=True)
+            app._set_status(f"AI Extract scan failed: {e}", ERROR)
+        finally:
+            app._aix_running = False
+            app._aix_queue.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+    app.after(60, lambda: _aix_poll_queue(app))
+
+
+def _aix_find_receiving_pages(app, pdf_path: str) -> List[int]:
+    keep = []
+    try:
+        doc = fitz.open(pdf_path)
+        for i, page in enumerate(doc):
+            native = page.get_text("text") or ""
+            text = native
+
+            if len(native.strip()) < 50:
+                try:
+                    rect = page.rect
+                    clip = fitz.Rect(0, 0, rect.width, rect.height * 0.40)
+                    scale = app.cfg["app_settings"].get("image_scale_factor", 2)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip)
+                    arr = app._preprocess_image(pix)
+                    arr = app._correct_rotation(arr)
+                    text = app._run_ocr(arr)
+                except Exception as e:
+                    logging.debug(f"[AI EXTRACT] page OCR failed p{i}: {e}")
+
+            if _page_is_receiving_report(text):
+                keep.append(i)
+        doc.close()
+    except Exception as e:
+        logging.error(f"[AI EXTRACT] page scan failed [{pdf_path}]: {e}", exc_info=True)
+    return keep
+
+
+def _aix_write_trimmed_pdf(src_path: str, keep_indices: List[int], dest_path: str):
+    src = fitz.open(src_path)
+    out = fitz.open()
+    for i in keep_indices:
+        out.insert_pdf(src, from_page=i, to_page=i)
+    out.save(dest_path)
+    out.close()
+    src.close()
+
+
+# ---------------------------------------------------------------------------
+# STEP 2: PROCESS VIA OCR.SPACE
+# ---------------------------------------------------------------------------
+def _aix_start_process(app):
+    if app._aix_running:
+        return
+
+    if not OCR_SPACE_AVAILABLE:
+        messagebox.showerror(
+            "OCR.space Unavailable",
+            "OCRSpaceExtractor could not be imported from ai_supplier_matcher.py.\n"
+            "Make sure that file exists and loads without errors.",
+        )
+        return
+
+    scanned = app.dirs.get("scanned", "")
+    temp = app._aix_temp_folder
+    os.makedirs(temp, exist_ok=True)
+
+    files = app._get_pdf_files_strict_order(scanned)
+    if not files:
+        messagebox.showwarning("AI Extract", "SCANNED folder is empty. Nothing to process.")
+        return
+
+    used_this_month = _aix_get_usage_this_month(app)
+    remaining = _OCR_FREE_MONTHLY_QUOTA - used_this_month
+    if remaining <= 0:
+        if not messagebox.askyesno(
+            "OCR.space Free Quota Reached",
+            f"You have already used {used_this_month} of your {_OCR_FREE_MONTHLY_QUOTA} "
+            f"free OCR.space requests this month.\n\nContinue anyway?",
+        ):
+            return
+
+    app._aix_running = True
+    app._set_buttons_state("disabled")
+    app._set_status("AI Extract: preparing & OCR.space processing started...", ACCENT)
+    _aix_set_api_status(app, "Preparing files...", ACCENT)
+
+    # Fresh run — clear old AI Extract rows so re-running Process doesn't
+    # pile up duplicates for files that are still sitting in SCANNED
+    app._aix_results = []
+    app._aix_row_map.clear()
+    app._aix_all_rows.clear()
+    for i in app._aix_tree.get_children():
+        app._aix_tree.delete(i)
+
+    ocr_cfg = dict(app.cfg.get("ocr_space", {}))
+    _engine_label = getattr(app, "_aix_ocr_engine_var", None)
+    if _engine_label is not None:
+        _sel = _engine_label.get()
+        if "Engine 1" in _sel:
+            ocr_cfg["OCREngine"] = 1
+        elif "Engine 3" in _sel:
+            ocr_cfg["OCREngine"] = 3
+        else:
+            ocr_cfg["OCREngine"] = 2
+
+    extractor = OCRSpaceExtractor(config=ocr_cfg)
+
+    def worker():
+        n_ok = 0
+        n_fail = 0
+        total_pages_used = 0
+        try:
+            total = len(files)
+            app.after(0, lambda: app._aix_progress.configure(maximum=max(total, 1), value=0))
+
+            for idx, src_path in enumerate(files, 1):
+                fname = os.path.basename(src_path)
+                temp_path = os.path.join(temp, fname)
+
+                # --- Prepare the temp copy that will actually be OCR'd ---
+                temp_is_fresh = (
+                    os.path.exists(temp_path)
+                    and os.path.getmtime(temp_path) >= os.path.getmtime(src_path)
+                )
+
+                if temp_is_fresh:
+                    # Reuse it — likely a manual Scan & Trim output, not stale
+                    was_modified = True
+                else:
+                    app._set_status(f"[AI EXTRACT] Preparing {fname} ({idx}/{total})", ACCENT)
+                    try:
+                        was_modified = _aix_compress_pdf_to_size(src_path, temp_path, target_mb=1.0)
+                    except Exception as e:
+                        logging.error(f"[AI EXTRACT] Prep failed [{fname}]: {e}", exc_info=True)
+                        shutil.copy2(src_path, temp_path)
+                        was_modified = False
+
+                # --- Count pages for usage/credit tracking ---
+                try:
+                    pdoc = fitz.open(temp_path)
+                    n_pages = pdoc.page_count
+                    pdoc.close()
+                except Exception:
+                    n_pages = 1
+
+                # --- OCR via OCR.space ---
+                _aix_set_api_status(app, f"Uploading {fname} to OCR.space...", ACCENT)
+                app._set_status(f"[AI EXTRACT] OCR.space {fname} ({idx}/{total})", ACCENT)
+
+                try:
+                    text, err = extractor.extract_from_file(temp_path)
+                except Exception as e:
+                    text, err = "", str(e)
+
+                total_pages_used += n_pages
+                _aix_add_usage_pages(app, n_pages)
+
+                if err:
+                    _aix_set_api_status(app, f"Error on {fname}: {err}", ERROR)
+                else:
+                    _aix_set_api_status(
+                        app, f"OK — {fname} ({n_pages} page(s), {len(text or '')} chars)", SUCCESS
+                    )
+
+                text = (text or "").upper()
+                fields = _aix_extract_fields_from_text(app, temp_path, text)
+
+                result = {
+                    "doc_id": f"{fname}|aix|{idx}",
+                    "file": fname,
+                    "date": fields["date"],
+                    "supplier": fields["supplier"],
+                    "po": fields["po"] or "MAM-0000",
+                    "invoice": fields["invoice"],
+                    "usd": fields["usd"],
+                    "mvr": fields["mvr"],
+                    "eur": fields["eur"],
+                    "gbp": fields["gbp"],
+                    "sgd": fields["sgd"],
+                    "grn": fields["grn"] or "RC-MAM-0000",
+                    "confidence": fields["confidence"],
+                    "is_valid": (err == ""),
+                    "errors": err,
+                    "temp_path": temp_path,
+                    "raw_path": src_path,
+                    "scan_index": idx,
+                    "was_modified": was_modified,
+                    "pages_used": n_pages,
+                }
+
+                if err == "":
+                    n_ok += 1
+                else:
+                    n_fail += 1
+                    logging.warning(f"[AI EXTRACT] OCR.space error [{fname}]: {err}")
+
+                app._aix_queue.put(("row", result))
+                app._aix_queue.put(("progress", idx))
+
+            _aix_set_api_status(
+                app,
+                f"Done — {n_ok} ok, {n_fail} error(s), {total_pages_used} page(s) used this run.",
+                SUCCESS if n_fail == 0 else WARNING,
+            )
+            app._set_status(
+                f"OCR complete - {n_ok} ok, {n_fail} with errors. Click 'Send to Tabs' to apply.",
+                SUCCESS if n_fail == 0 else WARNING,
+            )
+            app._notify("Maafushivaru - AI Extract Complete", f"{n_ok} processed, {n_fail} errors.")
+
+        except Exception as e:
+            logging.error(f"[AI EXTRACT] process error: {e}", exc_info=True)
+            app._set_status(f"AI Extract process failed: {e}", ERROR)
+            _aix_set_api_status(app, f"Fatal error: {e}", ERROR)
+        finally:
+            app._aix_running = False
+            app._aix_queue.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+    app.after(60, lambda: _aix_poll_queue(app))
+
+def _aix_extract_fields_from_text(app, pdf_path: str, text: str) -> Dict:
+    supplier = _aix_extract_supplier_raw(app, text)
+    confidence = 100.0 if supplier else 0.0
+
+    rr = app._extract_receiving_report_fields(pdf_path)
+
+    grn = rr.get("grn", "") or app._extract_grn_full(pdf_path, text) or "RC-MAM-0000"
+    po = rr.get("po", "") or app._extract_po_from_receiving_text(text) or "MAM-0000"
+    date_v = rr.get("date", "") or app._extract_date_from_receiving_text(text) or ""
+    totals = rr.get("totals", {"USD": "", "MVR": "", "EUR": "", "GBP": "", "SGD": ""})
+
+    invoice = app._extract_invoice(text, supplier_hint=supplier) or ""
+
+    return {
+        "supplier": supplier or "UNKNOWN SUPPLIER",
+        "confidence": confidence,
+        "grn": grn,
+        "po": po,
+        "date": date_v,
+        "invoice": invoice,
+        "usd": totals.get("USD", ""),
+        "mvr": totals.get("MVR", ""),
+        "eur": totals.get("EUR", ""),
+        "gbp": totals.get("GBP", ""),
+        "sgd": totals.get("SGD", ""),
+    }
+
+def _aix_extract_supplier_raw(app, text: str) -> str:
+    """
+    Extract supplier name from OCR text.
+
+    Handles multi-line OCR splits such as:
+        VILLA HAKATHA
+        SUPPLIER: PRIVATE LIMITED
+
+    Strategy:
+      Pass 1 - look at the line before, the SUPPLIER: line, and the line
+               after; build candidate strings; normalize company-suffix
+               variants; match against config supplier list (no aliases).
+      Pass 2 - simple inline pattern fallback.
+    """
+    if not text:
+        return ""
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    # ------------------------------------------------------------------
+    # Build canonical supplier name list from config (no aliases)
+    # ------------------------------------------------------------------
+    suppliers_cfg = app.cfg.get("suppliers", [])
+    supplier_names = []
+
+    if isinstance(suppliers_cfg, list):
+        supplier_names = [str(n).upper() for n in suppliers_cfg if n]
+    elif isinstance(suppliers_cfg, dict):
+        supplier_names = [str(n).upper() for n in suppliers_cfg.keys() if n]
+
+    # ------------------------------------------------------------------
+    # Normalizer: uppercase + collapse spaces + unify company suffixes
+    # ------------------------------------------------------------------
+    def _norm(v: str) -> str:
+        v = v.upper()
+        v = re.sub(r"\bPRIVATE\s+LIMITED\b",  "PVT LTD", v)
+        v = re.sub(r"\bPRIVATE\s+LTD\b",      "PVT LTD", v)
+        v = re.sub(r"\bPVT\.?\s*LTD\.?\b",     "PVT LTD", v)
+        v = re.sub(r"\bPTE\.?\s*LTD\.?\b",     "PTE LTD", v)
+        v = re.sub(r"\bLIMITED\b",             "LTD",     v)
+        v = re.sub(r"[^A-Z0-9 &.()\-]+",       " ",       v)
+        v = re.sub(r"\s+",                      " ",       v)
+        return v.strip()
+
+    # Pre-normalise all config names once
+    norm_supplier_names = [_norm(s) for s in supplier_names]
+
+    # ------------------------------------------------------------------
+    # Pass 1 - multi-line context matching around the SUPPLIER: label
+    # ------------------------------------------------------------------
+    for idx, line in enumerate(lines):
+        if not re.search(r"\bSUPPLIER\b", line, re.IGNORECASE):
+            continue
+
+        line_before = lines[idx - 1]          if idx > 0               else ""
+        line_after  = lines[idx + 1]          if idx + 1 < len(lines)  else ""
+
+        # Value written on the same line after the SUPPLIER: / VENDOR: label
+        m_inline = re.search(
+            r"\b(?:SUPPLIER(?:\s+NAME)?|VENDOR)\s*[:\-]\s*(.+)",
+            line,
+            re.IGNORECASE,
+        )
+        same_val = m_inline.group(1).strip() if m_inline else ""
+
+        # Build all candidate strings for this SUPPLIER: occurrence
+        candidates = []
+
+        # Most common split case:  line_before = "VILLA HAKATHA"
+        #                          same_val     = "PRIVATE LIMITED"
+        if line_before and same_val:
+            candidates.append(f"{line_before} {same_val}")
+
+        # Whole name on the same line:  SUPPLIER: VILLA HAKATHA PVT LTD
+        if same_val:
+            candidates.append(same_val)
+
+        # Split the other way:  same_val = "VILLA HAKATHA"
+        #                        line_after = "PRIVATE LIMITED"
+        if same_val and line_after:
+            candidates.append(f"{same_val} {line_after}")
+
+        # Entire name sits on line_before
+        if line_before:
+            candidates.append(line_before)
+
+        # Entire name sits on line_after
+        if line_after:
+            candidates.append(line_after)
+
+        # Wide sweep: all three pieces combined
+        if line_before and same_val and line_after:
+            candidates.append(f"{line_before} {same_val} {line_after}")
+
+        # --- Exact / substring match (normalised) ---
+        for cand in candidates:
+            nc = _norm(cand)
+            for i, ns in enumerate(norm_supplier_names):
+                if ns in nc or nc in ns:
+                    return supplier_names[i]   # return canonical config name
+
+        # --- Fuzzy match via rapidfuzz (if available) ---
+        try:
+            from rapidfuzz import process as rf_proc, fuzz as rf_fuzz
+
+            for cand in candidates:
+                nc = _norm(cand)
+                result = rf_proc.extractOne(
+                    nc,
+                    norm_supplier_names,
+                    scorer=rf_fuzz.token_sort_ratio,
+                    score_cutoff=75,
+                )
+                if result:
+                    matched_norm = result[0]
+                    try:
+                        matched_idx = norm_supplier_names.index(matched_norm)
+                        return supplier_names[matched_idx]
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Pass 2 - simple inline pattern fallback
+    # ------------------------------------------------------------------
+    patterns = [
+        r"SUPPLIER\s*[:\-]\s*(.+)",
+        r"VENDOR\s*[:\-]\s*(.+)",
+        r"SUPPLIER\s+NAME\s*[:\-]\s*(.+)",
+    ]
+
+    for line in lines:
+        for pat in patterns:
+            m = re.search(pat, line, re.IGNORECASE)
+            if m:
+                value = m.group(1).strip()
+                value = re.split(
+                    r"\s{2,}|(?:INVOICE|DATE|GRN|RC[-\s]*MAM|PO|PURCHASE\s+ORDER)\s*[:\-]?",
+                    value,
+                    maxsplit=1,
+                    flags=re.IGNORECASE,
+                )[0].strip(" :-")
+                if value:
+                    return value.upper()
+
+    return ""
+
+# ---------------------------------------------------------------------------
+# STEP 3: SEND TO TABS
+# ---------------------------------------------------------------------------
+def _aix_send_to_tabs(app):
+    if app._aix_running:
+        messagebox.showinfo("AI Extract", "Please wait for the current task to finish.")
+        return
+
+    if not app._aix_results:
+        messagebox.showwarning("AI Extract", "No results to send. Run 'Process' first.")
+        return
+
+    scanned = app.dirs.get("scanned", "")
+    processed = app.dirs.get("processed", "")
+    os.makedirs(processed, exist_ok=True)
+
+    n_renamed = 0
+    n_missing = 0
+
+    for result in app._aix_results:
+        fname = result.get("file", "")
+        supplier = (result.get("supplier") or "UNKNOWN SUPPLIER").strip().upper()
+        grn = (result.get("grn") or "RC-MAM-0000").strip().upper()
+        inv_raw = (result.get("invoice") or "").strip()
+
+        inv_part = f"IN {inv_raw}" if inv_raw and inv_raw.upper() != "NO-INVOICE" else "NO-INVOICE"
+        new_name = app._safe_filename(f"{supplier} GRN {grn} {inv_part}.pdf")
+
+        src = os.path.join(scanned, fname)
+        if not os.path.exists(src):
+            alt = os.path.join(processed, fname)
+            src = alt if os.path.exists(alt) else src
+
+        if not os.path.exists(src):
+            n_missing += 1
+            logging.warning(f"[AI EXTRACT] Original not found for {fname}")
+            continue
+
+        dest = os.path.join(processed, new_name)
+        base, ext = os.path.splitext(dest)
+        cnt = 1
+        while os.path.exists(dest) and os.path.abspath(dest) != os.path.abspath(src):
+            dest = f"{base}_{cnt}{ext}"
+            cnt += 1
+
+        try:
+            shutil.move(src, dest)
+            n_renamed += 1
+        except Exception as e:
+            logging.error(f"[AI EXTRACT] Rename failed [{fname}]: {e}", exc_info=True)
+            n_missing += 1
+            continue
+
+        rename_result = {
+            "doc_id": result["doc_id"],
+            "file": os.path.basename(dest),
+            "new_name": os.path.basename(dest),
+            "supplier": supplier,
+            "grn": grn,
+            "invoice": inv_raw if inv_raw.upper() != "NO-INVOICE" else "",
+            "invoice_dispatch": inv_raw if inv_raw.upper() != "NO-INVOICE" else "",
+            "date": result.get("date", ""),
+            "po": result.get("po", "") or "MAM-0000",
+            "usd": result.get("usd", ""),
+            "mvr": result.get("mvr", ""),
+            "eur": result.get("eur", ""),
+            "gbp": result.get("gbp", ""),
+            "sgd": result.get("sgd", ""),
+            "status": "success",
+            "dest_path": dest,
+            "duplicate_warning": "",
+            "confidence": result.get("confidence", 0.0),
+        }
+        app._rename_results.append(rename_result)
+        app._add_rename_tree_row(rename_result)
+
+        dispatch_result = app._build_dispatch_from_rename_result(rename_result, result.get("scan_index", 0))
+        dispatch_result["raw_path"] = dest
+        app._dispatch_results.append(dispatch_result)
+        app._add_dispatch_tree_row(dispatch_result)
+
+    app._refresh_dashboard_stats()
+    app._set_status(
+        f"Sent to tabs - {n_renamed} renamed, {n_missing} missing.",
+        SUCCESS if n_missing == 0 else WARNING,
+    )
+    messagebox.showinfo(
+        "Send to Tabs",
+        f"Done.\n\nRenamed: {n_renamed}\nMissing originals: {n_missing}\n\nCheck the OCR Renamer and GRN Dispatch tabs.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# TREE
+# ---------------------------------------------------------------------------
+def _aix_add_row(app, result: Dict):
+    iv = result.get("is_valid", False)
+    conf = result.get("confidence", 0.0)
+    conf_thr = app.cfg.get("app_settings", {}).get("confidence_warn_threshold", 80)
+    sup = result.get("supplier", "")
+    was_modified = result.get("was_modified", False)
+
+    if not iv:
+        tag = "invalid"
+    elif was_modified:
+        tag = "modified"          # was compressed or pre-trimmed — flagged orange
+    elif sup == "UNKNOWN SUPPLIER" or conf <= 0:
+        tag = "unknown"
+    elif conf < conf_thr:
+        tag = "low_conf"
+    else:
+        tag = "valid"
+
+    for t, fg in [
+        ("valid", SUCCESS),
+        ("invalid", ERROR),
+        ("unknown", WARNING),
+        ("low_conf", WARNING),
+        ("modified", "#F97316"),   # orange
+    ]:
+        app._aix_tree.tag_configure(t, foreground=fg)
+
+    row_id = app._aix_tree.insert(
+        "",
+        "end",
+        tags=(tag,),
+        values=(
+            result.get("file", ""),
+            result.get("date", ""),
+            sup,
+            app._conf_display(conf),
+            result.get("po", "") or "MAM-0000",
+            result.get("invoice", ""),
+            result.get("usd", ""),
+            result.get("mvr", ""),
+            result.get("eur", ""),
+            result.get("gbp", ""),
+            result.get("sgd", ""),
+            result.get("grn", ""),
+        ),
+    )
+    app._aix_row_map[row_id] = result
+    app._aix_all_rows.append(row_id)
+
+def _aix_on_tree_edit(app, row_id, col_index, old_val, new_val):
+    vals = list(app._aix_tree.item(row_id, "values"))
+
+    if col_index == 11:
+        nv = str(new_val).strip().upper()
+        if nv and not nv.startswith("RC-MAM-"):
+            nv = "RC-MAM-" + nv
+        new_val = nv
+
+    if col_index == 5:
+        raw = str(new_val).strip()
+        if raw.upper().startswith("IN "):
+            raw = raw[3:].strip()
+        new_val = raw
+
+    if col_index == 2:
+        new_val = str(new_val).strip().upper()
+
+    vals[col_index] = new_val
+    app._aix_tree.item(row_id, values=vals)
+
+    result = app._aix_row_map.get(row_id)
+    if result:
+        keys = ["file", "date", "supplier", "_conf", "po", "invoice",
+                "usd", "mvr", "eur", "gbp", "sgd", "grn"]
+        if col_index < len(keys) and keys[col_index] != "_conf":
+            result[keys[col_index]] = new_val
+
+    app._set_status("AI Extract cell updated.")
+
+
+def _aix_clear(app):
+    app._aix_results = []
+    app._aix_row_map.clear()
+    app._aix_all_rows.clear()
+    for i in app._aix_tree.get_children():
+        app._aix_tree.delete(i)
+    app._set_status("AI Extract results cleared.")
+    
+# ---------------------------------------------------------------------------
+# COMPRESS LOG VIEWER
+# ---------------------------------------------------------------------------
+def _aix_show_compress_log(app):
+    """Show a popup window with the compress / trim session log."""
+    win = tk.Toplevel(app)
+    win.title("Compress / Trim Log")
+    win.geometry("780x500")
+    win.configure(bg=PANEL)
+    win.transient(app)
+    win.grab_set()
+
+    # Header
+    tk.Label(
+        win,
+        text="📋  Compress & Trim Log",
+        bg=PANEL,
+        fg=TEXT,
+        font=("Segoe UI", 12, "bold"),
+    ).pack(anchor="w", padx=16, pady=(14, 4))
+
+    tk.Label(
+        win,
+        text="Generated by Scan & Trim step. Re-run Scan & Trim to refresh.",
+        bg=PANEL,
+        fg=MUTED,
+        font=("Segoe UI", 8),
+    ).pack(anchor="w", padx=16, pady=(0, 8))
+
+    # Scrolled text area
+    txt_frame = tk.Frame(win, bg=PANEL)
+    txt_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+
+    txt = tk.Text(
+        txt_frame,
+        bg=PANEL2,
+        fg=TEXT,
+        font=("Consolas", 9),
+        wrap=tk.WORD,
+        relief="flat",
+        borderwidth=0,
+        selectbackground=ACCENT,
+    )
+    sb = ttk.Scrollbar(txt_frame, orient="vertical", command=txt.yview)
+    txt.configure(yscrollcommand=sb.set)
+    txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+    # Populate
+    if app._aix_compress_log:
+        content = "\n".join(app._aix_compress_log)
+    else:
+        content = "No compress log yet. Run 'Scan & Trim PDFs' first."
+
+    txt.insert("1.0", content)
+    txt.configure(state="disabled")
+
+    # Bottom buttons
+    btn_bar = tk.Frame(win, bg=PANEL)
+    btn_bar.pack(fill=tk.X, padx=16, pady=(0, 12))
+
+    def _copy_log():
+        win.clipboard_clear()
+        win.clipboard_append(txt.get("1.0", tk.END))
+        win.update()
+
+    ttk.Button(btn_bar, text="📋  Copy to Clipboard", command=_copy_log).pack(
+        side=tk.LEFT, padx=(0, 8)
+    )
+    ttk.Button(btn_bar, text="Close", command=win.destroy).pack(side=tk.RIGHT)
+
+# ---------------------------------------------------------------------------
+# DEBUG WINDOW - Test OCR engines on individual files
+# ---------------------------------------------------------------------------
+def _aix_open_debug_window(app):
+    """
+    Debug window: pick a file from TEMP API PDFS, pick an OCR engine,
+    run OCR.space, and inspect raw text + parsed fields side by side.
+    """
+    if not OCR_SPACE_AVAILABLE:
+        messagebox.showerror(
+            "OCR.space Unavailable",
+            "OCRSpaceExtractor is not available. Cannot run debug.",
+        )
+        return
+
+    temp_folder = app._aix_temp_folder
+
+    # Collect available PDF files
+    if os.path.isdir(temp_folder):
+        pdf_files = sorted(
+            [f for f in os.listdir(temp_folder) if f.lower().endswith(".pdf")]
+        )
+    else:
+        pdf_files = []
+
+    # -----------------------------------------------------------------------
+    # Build window
+    # -----------------------------------------------------------------------
+    win = tk.Toplevel(app)
+    win.title("AI Extract - OCR Engine Debugger")
+    win.geometry("1020x680")
+    win.configure(bg=PANEL)
+    win.transient(app)
+
+    # --- Title bar ---
+    tk.Label(
+        win,
+        text="🔧  OCR Engine Debugger",
+        bg=PANEL,
+        fg=TEXT,
+        font=("Segoe UI", 12, "bold"),
+    ).pack(anchor="w", padx=16, pady=(14, 2))
+
+    tk.Label(
+        win,
+        text="Select a trimmed PDF and an engine, then click Run OCR Test.",
+        bg=PANEL,
+        fg=MUTED,
+        font=("Segoe UI", 8),
+    ).pack(anchor="w", padx=16, pady=(0, 10))
+
+    # --- Controls row ---
+    ctrl = tk.Frame(win, bg=PANEL2, height=52)
+    ctrl.pack(fill=tk.X, padx=0)
+    ctrl.pack_propagate(False)
+
+    # File dropdown
+    tk.Label(
+        ctrl,
+        text="File:",
+        bg=PANEL2,
+        fg=TEXT,
+        font=("Segoe UI", 9),
+    ).pack(side=tk.LEFT, padx=(14, 4), pady=10)
+
+    _debug_file_var = tk.StringVar(
+        value=pdf_files[0] if pdf_files else "(no files in TEMP API PDFS)"
+    )
+    _debug_file_combo = ttk.Combobox(
+        ctrl,
+        textvariable=_debug_file_var,
+        values=pdf_files if pdf_files else ["(no files)"],
+        state="readonly",
+        width=36,
+    )
+    _debug_file_combo.pack(side=tk.LEFT, padx=(0, 14), pady=10)
+
+    # Refresh file list button
+    def _refresh_file_list():
+        if os.path.isdir(temp_folder):
+            updated = sorted(
+                [f for f in os.listdir(temp_folder) if f.lower().endswith(".pdf")]
+            )
+        else:
+            updated = []
+        _debug_file_combo["values"] = updated if updated else ["(no files)"]
+        if updated:
+            _debug_file_var.set(updated[0])
+
+    ttk.Button(
+        ctrl,
+        text="↺ Refresh",
+        command=_refresh_file_list,
+    ).pack(side=tk.LEFT, padx=(0, 14), pady=10)
+
+    # Engine selector
+    tk.Label(
+        ctrl,
+        text="Engine:",
+        bg=PANEL2,
+        fg=TEXT,
+        font=("Segoe UI", 9),
+    ).pack(side=tk.LEFT, padx=(0, 4), pady=10)
+
+    _debug_engine_var = tk.StringVar(value="Engine 2 (Enhanced)")
+    _debug_engine_combo = ttk.Combobox(
+        ctrl,
+        textvariable=_debug_engine_var,
+        values=[
+            "Engine 1 (Default)",
+            "Engine 2 (Enhanced)",
+            "Engine 3 (Extra Accurate)",
+        ],
+        state="readonly",
+        width=22,
+    )
+    _debug_engine_combo.pack(side=tk.LEFT, padx=(0, 14), pady=10)
+
+    # Status label (right side of ctrl bar)
+    _debug_status_var = tk.StringVar(value="Ready.")
+    _debug_status_lbl = tk.Label(
+        ctrl,
+        textvariable=_debug_status_var,
+        bg=PANEL2,
+        fg=MUTED,
+        font=("Segoe UI", 9),
+    )
+    _debug_status_lbl.pack(side=tk.RIGHT, padx=14, pady=10)
+
+    # Run button
+    _debug_btn = ttk.Button(ctrl, text="▶  Run OCR Test", style="Accent.TButton")
+    _debug_btn.pack(side=tk.LEFT, padx=(0, 8), pady=10)
+
+    # -----------------------------------------------------------------------
+    # Output area — left: raw OCR text / right: parsed fields
+    # -----------------------------------------------------------------------
+    pane = tk.Frame(win, bg=PANEL)
+    pane.pack(fill=tk.BOTH, expand=True, padx=16, pady=(10, 0))
+
+    # Left panel - raw OCR text
+    left = tk.Frame(pane, bg=PANEL)
+    left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+
+    tk.Label(
+        left,
+        text="Raw OCR Text",
+        bg=PANEL,
+        fg=MUTED,
+        font=("Segoe UI", 9, "bold"),
+    ).pack(anchor="w", pady=(0, 4))
+
+    raw_frame = tk.Frame(left, bg=PANEL2)
+    raw_frame.pack(fill=tk.BOTH, expand=True)
+
+    raw_text = tk.Text(
+        raw_frame,
+        bg=PANEL2,
+        fg=TEXT,
+        font=("Consolas", 9),
+        wrap=tk.WORD,
+        relief="flat",
+        borderwidth=0,
+        selectbackground=ACCENT,
+    )
+    raw_sb = ttk.Scrollbar(raw_frame, orient="vertical", command=raw_text.yview)
+    raw_text.configure(yscrollcommand=raw_sb.set)
+    raw_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
+    raw_sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+    # Right panel - parsed fields
+    right = tk.Frame(pane, bg=PANEL)
+    right.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(6, 0))
+    right.configure(width=320)
+
+    tk.Label(
+        right,
+        text="Parsed Fields",
+        bg=PANEL,
+        fg=MUTED,
+        font=("Segoe UI", 9, "bold"),
+    ).pack(anchor="w", pady=(0, 4))
+
+    fields_frame = tk.Frame(right, bg=PANEL2)
+    fields_frame.pack(fill=tk.BOTH, expand=True)
+
+    fields_text = tk.Text(
+        fields_frame,
+        bg=PANEL2,
+        fg=TEXT,
+        font=("Consolas", 9),
+        wrap=tk.WORD,
+        relief="flat",
+        borderwidth=0,
+        selectbackground=ACCENT,
+        width=38,
+    )
+    fields_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+    # -----------------------------------------------------------------------
+    # Bottom bar
+    # -----------------------------------------------------------------------
+    bot = tk.Frame(win, bg=PANEL)
+    bot.pack(fill=tk.X, padx=16, pady=10)
+
+    def _copy_raw():
+        win.clipboard_clear()
+        win.clipboard_append(raw_text.get("1.0", tk.END))
+        win.update()
+
+    ttk.Button(bot, text="📋  Copy Raw Text", command=_copy_raw).pack(
+        side=tk.LEFT, padx=(0, 8)
+    )
+    ttk.Button(bot, text="Close", command=win.destroy).pack(side=tk.RIGHT)
+
+    # -----------------------------------------------------------------------
+    # Run OCR logic
+    # -----------------------------------------------------------------------
+    def _run_debug():
+        fname = _debug_file_var.get()
+        if not fname or fname.startswith("("):
+            messagebox.showwarning("Debug OCR", "No file selected.", parent=win)
+            return
+
+        fpath = os.path.join(temp_folder, fname)
+        if not os.path.exists(fpath):
+            messagebox.showerror(
+                "Debug OCR",
+                f"File not found:\n{fpath}",
+                parent=win,
+            )
+            return
+
+        # Determine engine number from selection
+        sel = _debug_engine_var.get()
+        if "Engine 1" in sel:
+            engine_num = 1
+        elif "Engine 3" in sel:
+            engine_num = 3
+        else:
+            engine_num = 2
+
+        _debug_btn.configure(state="disabled")
+        _debug_status_var.set(f"Running OCR.space Engine {engine_num} on {fname} ...")
+        win.update_idletasks()
+
+        # Clear previous output
+        raw_text.configure(state="normal")
+        raw_text.delete("1.0", tk.END)
+        fields_text.configure(state="normal")
+        fields_text.delete("1.0", tk.END)
+
+        def _worker():
+            try:
+                ocr_cfg = dict(app.cfg.get("ocr_space", {}))
+                ocr_cfg["OCREngine"] = engine_num
+
+                extractor = OCRSpaceExtractor(config=ocr_cfg)
+                text, err = extractor.extract_from_file(fpath)
+                text_upper = (text or "").upper()
+
+                # Extract fields
+                fields = _aix_extract_fields_from_text(app, fpath, text_upper)
+
+                def _update_ui():
+                    # Raw text panel
+                    raw_text.configure(state="normal")
+                    raw_text.delete("1.0", tk.END)
+                    if err:
+                        raw_text.insert(tk.END, f"[OCR ERROR]\n{err}\n\n")
+                    raw_text.insert(tk.END, text or "(no text returned)")
+                    raw_text.configure(state="disabled")
+
+                    # Parsed fields panel
+                    fields_text.configure(state="normal")
+                    fields_text.delete("1.0", tk.END)
+                    lines_out = [
+                        f"Engine         : {engine_num}",
+                        f"File           : {fname}",
+                        f"OCR Error      : {err or 'None'}",
+                        "",
+                        "--- Extracted Fields ---",
+                        f"Supplier       : {fields.get('supplier', '')}",
+                        f"Confidence     : {fields.get('confidence', 0.0):.1f}%",
+                        f"GRN            : {fields.get('grn', '')}",
+                        f"PO #           : {fields.get('po', '')}",
+                        f"Invoice #      : {fields.get('invoice', '')}",
+                        f"Date           : {fields.get('date', '')}",
+                        "",
+                        "--- Totals ---",
+                        f"USD            : {fields.get('usd', '')}",
+                        f"MVR            : {fields.get('mvr', '')}",
+                        f"EUR            : {fields.get('eur', '')}",
+                        f"GBP            : {fields.get('gbp', '')}",
+                        f"SGD            : {fields.get('sgd', '')}",
+                        "",
+                        "--- Raw OCR Stats ---",
+                        f"Char count     : {len(text or '')}",
+                        f"Line count     : {len((text or '').splitlines())}",
+                    ]
+                    fields_text.insert(tk.END, "\n".join(lines_out))
+                    fields_text.configure(state="disabled")
+
+                    status_color = MUTED if not err else WARNING
+                    _debug_status_lbl.configure(fg=status_color)
+                    _debug_status_var.set(
+                        f"Done. Engine {engine_num}  |  "
+                        f"Supplier: {fields.get('supplier', 'UNKNOWN')}  |  "
+                        f"Chars: {len(text or '')}"
+                    )
+                    _debug_btn.configure(state="normal")
+
+                win.after(0, _update_ui)
+
+            except Exception as ex:
+                def _show_err():
+                    _debug_status_var.set(f"Error: {ex}")
+                    _debug_status_lbl.configure(fg=ERROR)
+                    _debug_btn.configure(state="normal")
+                    raw_text.configure(state="normal")
+                    raw_text.insert(tk.END, f"[EXCEPTION]\n{ex}")
+                    raw_text.configure(state="disabled")
+                win.after(0, _show_err)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    _debug_btn.configure(command=_run_debug)
+
+# ---------------------------------------------------------------------------
+# QUEUE POLLING
+# ---------------------------------------------------------------------------
+def _aix_poll_queue(app):
+    try:
+        while True:
+            item = app._aix_queue.get_nowait()
+            if item is None:
+                app._set_buttons_state("normal")
+                app._refresh_dashboard_stats()
+                return
+
+            kind, data = item
+
+            if kind == "row":
+                app._aix_results.append(data)
+                _aix_add_row(app, data)
+
+            elif kind == "progress":
+                app._aix_progress.configure(value=data)
+
+    except queue.Empty:
+        pass
+
+    if app._aix_running:
+        app.after(60, lambda: _aix_poll_queue(app))
