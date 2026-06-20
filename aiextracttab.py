@@ -135,6 +135,56 @@ def _aix_set_api_status(app, text: str, color=None):
         app.after(0, lambda: app._aix_api_status_var.set(text))
     if hasattr(app, "_aix_api_status_lbl"):
         app.after(0, lambda: app._aix_api_status_lbl.configure(fg=color))
+    _aix_log(app, "API", text)
+
+
+# ---------------------------------------------------------------------------
+# UNIFIED LOGS  (Compress / API / Process / Send / System in one window)
+# ---------------------------------------------------------------------------
+_AIX_LOG_CATEGORIES = ["COMPRESS", "API", "PROCESS", "SEND", "SYSTEM"]
+_AIX_LOG_MAX = 5000
+
+def _aix_log(app, category: str, message: str):
+    """Append one entry to the unified AI-Extract log store.
+
+    Thread-safe enough for our use (CPython list.append is atomic). The Logs
+    window renders from this store on a timer, so worker threads never touch Tk.
+    """
+    if not message:
+        return
+    cat = (category or "SYSTEM").upper()
+    entry = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "cat": cat,
+        "msg": str(message),
+    }
+    store = getattr(app, "_aix_logs", None)
+    if store is None:
+        store = app._aix_logs = []
+    store.append(entry)
+    if len(store) > _AIX_LOG_MAX:
+        del store[: len(store) - _AIX_LOG_MAX]
+    try:
+        logging.info(f"[AIX:{cat}] {entry['msg'].splitlines()[0]}")
+    except Exception:
+        pass
+
+def _aix_clog(app, message: str):
+    """Compress/Trim log: keep the legacy buffer AND feed the unified Logs."""
+    store = getattr(app, "_aix_compress_log", None)
+    if store is None:
+        store = app._aix_compress_log = []
+    store.append(message)
+    _aix_log(app, "COMPRESS", message)
+
+def _aix_log_color(cat: str):
+    return {
+        "COMPRESS": WARNING,
+        "API": ACCENT,
+        "PROCESS": TEXT,
+        "SEND": SUCCESS,
+        "SYSTEM": MUTED,
+    }.get((cat or "").upper(), TEXT)
 # ---------------------------------------------------------------------------
 # PDF SIZE COMPRESSION (target < 1 MB so OCR.space free tier accepts it)
 # ---------------------------------------------------------------------------
@@ -203,7 +253,10 @@ def add_ai_extract_tab(app):
     app._aix_queue = queue.Queue()
     app._aix_running = False
     app._aix_temp_folder = os.path.join(app.dirs.get("base", "."), "TEMP API PDFS")
-    app._aix_compress_log = []       # stores trim/compress step messages
+    app._aix_compress_log = []       # legacy trim/compress buffer (still used)
+    app._aix_logs = []               # unified log store (compress/api/process/send)
+    app._aix_logs_window = None
+    app._aix_logs_text = None
 
     frame = app._make_tab("AI Extract")
     frame.configure(style="TFrame")
@@ -250,8 +303,8 @@ def add_ai_extract_tab(app):
     # --- Compress Log button ---
     app._aix_btn_compress_log = ttk.Button(
         ctrl_bar,
-        text="📋  Compress Log",
-        command=lambda: _aix_show_compress_log(app),
+        text="📋  Logs",
+        command=lambda: _aix_show_logs(app),
     )
     app._aix_btn_compress_log.pack(side=tk.LEFT, padx=4, pady=8)
 
@@ -415,7 +468,7 @@ def _aix_start_scan_trim(app):
         kept = 0
         skipped = 0
         app._aix_compress_log.clear()
-        app._aix_compress_log.append(
+        _aix_clog(app, 
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Compress/Trim session started."
         )
         try:
@@ -444,7 +497,7 @@ def _aix_start_scan_trim(app):
                         f"[{datetime.now().strftime('%H:%M:%S')}]  SKIPPED: {fname} "
                         f"— no receiving-report pages found."
                     )
-                    app._aix_compress_log.append(skip_msg)
+                    _aix_clog(app, skip_msg)
                     logging.info(f"[AI EXTRACT] No receiving pages found in {fname} - skipped.")
                     app._aix_queue.put(("progress", idx))
                     continue
@@ -465,13 +518,13 @@ def _aix_start_scan_trim(app):
                         f"   Reduction   : {ratio:.1f}%\n"
                         f"   Saved to    : {dest}\n"
                     )
-                    app._aix_compress_log.append(log_msg)
+                    _aix_clog(app, log_msg)
                 except Exception as e:
                     skipped += 1
                     err_msg = (
                         f"[{datetime.now().strftime('%H:%M:%S')}]  ERROR trimming {fname}: {e}"
                     )
-                    app._aix_compress_log.append(err_msg)
+                    _aix_clog(app, err_msg)
                     logging.error(f"[AI EXTRACT] Trim failed [{fname}]: {e}", exc_info=True)
 
                 app._aix_queue.put(("progress", idx))
@@ -480,7 +533,7 @@ def _aix_start_scan_trim(app):
                 f"[{datetime.now().strftime('%H:%M:%S')}]  Session complete. "
                 f"Kept: {kept}   Skipped: {skipped}"
             )
-            app._aix_compress_log.append(summary)
+            _aix_clog(app, summary)
             app._set_status(
                 f"Trim complete - {kept} file(s) saved to TEMP API PDFS, {skipped} skipped.",
                 SUCCESS if skipped == 0 else WARNING,
@@ -600,6 +653,10 @@ def _aix_start_process(app, auto=False):
     if target_mb <= 0:
         target_mb = 1.0
 
+    _aix_log(app, "PROCESS",
+             f"Run started ({'auto' if auto else 'manual'}): {len(files)} file(s), "
+             f"compress threshold {target_mb:.2f} MB.")
+
     app._aix_running = True
     app._set_buttons_state("disabled")
     app._set_status("AI Extract: preparing & OCR.space processing started...", ACCENT)
@@ -655,6 +712,18 @@ def _aix_start_process(app, auto=False):
                         logging.error(f"[AI EXTRACT] Prep failed [{fname}]: {e}", exc_info=True)
                         shutil.copy2(src_path, temp_path)
                         was_modified = False
+
+                try:
+                    _src_mb = os.path.getsize(src_path) / (1024 * 1024)
+                    _tmp_mb = os.path.getsize(temp_path) / (1024 * 1024)
+                    if temp_is_fresh:
+                        _aix_log(app, "COMPRESS", f"{fname}: reused existing trimmed copy ({_tmp_mb:.2f} MB)")
+                    elif was_modified:
+                        _aix_log(app, "COMPRESS", f"{fname}: {_src_mb:.2f} MB > {target_mb:.2f} MB limit -> compressed to {_tmp_mb:.2f} MB")
+                    else:
+                        _aix_log(app, "COMPRESS", f"{fname}: {_src_mb:.2f} MB <= {target_mb:.2f} MB limit -> sent as-is")
+                except Exception:
+                    pass
 
                 # --- Count pages for usage/credit tracking ---
                 try:
@@ -715,6 +784,10 @@ def _aix_start_process(app, auto=False):
                     n_fail += 1
                     logging.warning(f"[AI EXTRACT] OCR.space error [{fname}]: {err}")
 
+                _aix_log(app, "PROCESS",
+                         f"{fname}: supplier={result['supplier']}, grn={result['grn']}, "
+                         f"po={result['po']}, invoice={result['invoice'] or '-'}, "
+                         f"conf={result['confidence']:.0f}%" + (f", ERROR: {err}" if err else ""))
                 app._aix_queue.put(("row", result))
                 app._aix_queue.put(("progress", idx))
 
@@ -727,6 +800,8 @@ def _aix_start_process(app, auto=False):
                 f"OCR complete - {n_ok} ok, {n_fail} with errors. Click 'Send to Tabs' to apply.",
                 SUCCESS if n_fail == 0 else WARNING,
             )
+            _aix_log(app, "PROCESS",
+                     f"Run complete - {n_ok} ok, {n_fail} error(s), {total_pages_used} page(s) used.")
             app._notify("Maafushivaru - AI Extract Complete", f"{n_ok} processed, {n_fail} errors.")
 
         except Exception as e:
@@ -744,9 +819,23 @@ def _aix_extract_fields_from_text(app, pdf_path: str, text: str) -> Dict:
     supplier = _aix_extract_supplier_raw(app, text)
     confidence = 100.0 if supplier else 0.0
 
-    rr = app._extract_receiving_report_fields(pdf_path)
+    # FAST PATH: OCR.space already returned the text, so parse every field
+    # directly from it. The old code called _extract_receiving_report_fields()
+    # / _extract_grn_full(), which re-opened the PDF and re-ran LOCAL OCR (twice
+    # per page, at the configured scale) - the cause of the slowdown after
+    # characters were extracted. No re-OCR happens here anymore.
+    rr = app._extract_receiving_report_fields_from_text(text)
 
-    grn = rr.get("grn", "") or app._extract_grn_full(pdf_path, text) or "RC-MAM-0000"
+    grn = rr.get("grn", "")
+    if not grn:
+        # Text-based GRN fallback (no PDF re-open, no re-OCR).
+        try:
+            nums = app._extract_grn_candidates_from_receiving_text((text or "").upper())
+            grn = app._build_grn_chain(nums) if nums else ""
+        except Exception:
+            grn = ""
+    grn = grn or "RC-MAM-0000"
+
     po = rr.get("po", "") or app._extract_po_from_receiving_text(text) or "MAM-0000"
     date_v = rr.get("date", "") or app._extract_date_from_receiving_text(text) or ""
     totals = rr.get("totals", {"USD": "", "MVR": "", "EUR": "", "GBP": "", "SGD": ""})
@@ -968,6 +1057,7 @@ def _aix_send_to_tabs(app, auto=False):
         try:
             shutil.move(src, dest)
             n_renamed += 1
+            _aix_log(app, "SEND", f"{fname} -> {os.path.basename(dest)}")
         except Exception as e:
             logging.error(f"[AI EXTRACT] Rename failed [{fname}]: {e}", exc_info=True)
             n_missing += 1
@@ -1002,6 +1092,7 @@ def _aix_send_to_tabs(app, auto=False):
         app._add_dispatch_tree_row(dispatch_result)
 
     app._refresh_dashboard_stats()
+    _aix_log(app, "SEND", f"Sent to tabs - {n_renamed} renamed, {n_missing} missing.")
     app._set_status(
         f"Sent to tabs - {n_renamed} renamed, {n_missing} missing.",
         SUCCESS if n_missing == 0 else WARNING,
@@ -1112,61 +1203,98 @@ def _aix_clear(app):
 # ---------------------------------------------------------------------------
 # COMPRESS LOG VIEWER
 # ---------------------------------------------------------------------------
-def _aix_show_compress_log(app):
-    """Show a popup window with the compress / trim session log."""
+def _aix_render_logs(app):
+    """(Re)draw the Logs window from the unified log store, honoring the current
+    category filter. Runs on a timer while the window is open so entries added by
+    worker threads appear automatically (threads never touch Tk directly)."""
+    win = getattr(app, "_aix_logs_window", None)
+    txt = getattr(app, "_aix_logs_text", None)
+    if not win or not txt:
+        return
+    try:
+        if not win.winfo_exists():
+            app._aix_logs_window = None
+            return
+    except Exception:
+        app._aix_logs_window = None
+        return
+
+    flt = getattr(app, "_aix_logs_filter_var", None)
+    selected = flt.get() if flt else "ALL"
+
+    logs = getattr(app, "_aix_logs", []) or []
+    if selected and selected != "ALL":
+        logs = [e for e in logs if e.get("cat") == selected]
+
+    sig = (selected, len(logs))
+    if getattr(app, "_aix_logs_last_sig", None) == sig:
+        app._aix_logs_after_id = win.after(800, lambda: _aix_render_logs(app))
+        return
+    app._aix_logs_last_sig = sig
+
+    txt.configure(state="normal")
+    txt.delete("1.0", tk.END)
+    if not logs:
+        txt.insert("1.0", "No log entries yet.")
+    else:
+        for e in logs:
+            txt.insert(tk.END, f"[{e['ts']}] [{e['cat']}] {e['msg']}\n", e["cat"])
+    txt.configure(state="disabled")
+    txt.see(tk.END)
+    app._aix_logs_after_id = win.after(800, lambda: _aix_render_logs(app))
+
+def _set_sig_dirty(app):
+    app._aix_logs_last_sig = None
+
+def _aix_show_logs(app):
+    """Unified Logs window: Compress, API, Process, Send & System in one place,
+    with a category filter and live auto-refresh."""
+    existing = getattr(app, "_aix_logs_window", None)
+    if existing is not None:
+        try:
+            if existing.winfo_exists():
+                existing.deiconify(); existing.lift(); existing.focus_force()
+                return
+        except Exception:
+            pass
+
     win = tk.Toplevel(app)
-    win.title("Compress / Trim Log")
-    win.geometry("780x500")
+    win.title("Logs")
+    win.geometry("860x560")
     win.configure(bg=PANEL)
     win.transient(app)
-    win.grab_set()
+    app._aix_logs_window = win
+    app._aix_logs_last_sig = None
 
-    # Header
-    tk.Label(
-        win,
-        text="📋  Compress & Trim Log",
-        bg=PANEL,
-        fg=TEXT,
-        font=("Segoe UI", 12, "bold"),
-    ).pack(anchor="w", padx=16, pady=(14, 4))
+    tk.Label(win, text="📜  Logs", bg=PANEL, fg=TEXT,
+             font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=16, pady=(14, 2))
+    tk.Label(win,
+             text="All AI Extract activity in one place - Compress, API, Process & Send. Updates live.",
+             bg=PANEL, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w", padx=16, pady=(0, 8))
 
-    tk.Label(
-        win,
-        text="Generated by Scan & Trim step. Re-run Scan & Trim to refresh.",
-        bg=PANEL,
-        fg=MUTED,
-        font=("Segoe UI", 8),
-    ).pack(anchor="w", padx=16, pady=(0, 8))
+    filt_bar = tk.Frame(win, bg=PANEL)
+    filt_bar.pack(fill=tk.X, padx=16, pady=(0, 6))
+    tk.Label(filt_bar, text="Show:", bg=PANEL, fg=TEXT,
+             font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 6))
+    app._aix_logs_filter_var = tk.StringVar(value="ALL")
+    combo = ttk.Combobox(filt_bar, textvariable=app._aix_logs_filter_var,
+                         values=["ALL"] + _AIX_LOG_CATEGORIES, state="readonly",
+                         width=14, font=("Segoe UI", 9))
+    combo.pack(side=tk.LEFT)
+    combo.bind("<<ComboboxSelected>>", lambda _e: (_set_sig_dirty(app), _aix_render_logs(app)))
 
-    # Scrolled text area
     txt_frame = tk.Frame(win, bg=PANEL)
     txt_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
-
-    txt = tk.Text(
-        txt_frame,
-        bg=PANEL2,
-        fg=TEXT,
-        font=("Consolas", 9),
-        wrap=tk.WORD,
-        relief="flat",
-        borderwidth=0,
-        selectbackground=ACCENT,
-    )
+    txt = tk.Text(txt_frame, bg=PANEL2, fg=TEXT, font=("Consolas", 9), wrap=tk.WORD,
+                  relief="flat", borderwidth=0, selectbackground=ACCENT)
     sb = ttk.Scrollbar(txt_frame, orient="vertical", command=txt.yview)
     txt.configure(yscrollcommand=sb.set)
     txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     sb.pack(side=tk.RIGHT, fill=tk.Y)
+    app._aix_logs_text = txt
+    for cat in _AIX_LOG_CATEGORIES:
+        txt.tag_configure(cat, foreground=_aix_log_color(cat))
 
-    # Populate
-    if app._aix_compress_log:
-        content = "\n".join(app._aix_compress_log)
-    else:
-        content = "No compress log yet. Run 'Scan & Trim PDFs' first."
-
-    txt.insert("1.0", content)
-    txt.configure(state="disabled")
-
-    # Bottom buttons
     btn_bar = tk.Frame(win, bg=PANEL)
     btn_bar.pack(fill=tk.X, padx=16, pady=(0, 12))
 
@@ -1175,10 +1303,40 @@ def _aix_show_compress_log(app):
         win.clipboard_append(txt.get("1.0", tk.END))
         win.update()
 
-    ttk.Button(btn_bar, text="📋  Copy to Clipboard", command=_copy_log).pack(
-        side=tk.LEFT, padx=(0, 8)
-    )
-    ttk.Button(btn_bar, text="Close", command=win.destroy).pack(side=tk.RIGHT)
+    def _clear_log():
+        app._aix_logs = []
+        if getattr(app, "_aix_compress_log", None) is not None:
+            app._aix_compress_log.clear()
+        _set_sig_dirty(app)
+        _aix_render_logs(app)
+
+    def _on_close():
+        try:
+            aid = getattr(app, "_aix_logs_after_id", None)
+            if aid:
+                win.after_cancel(aid)
+        except Exception:
+            pass
+        app._aix_logs_window = None
+        app._aix_logs_text = None
+        win.destroy()
+
+    ttk.Button(btn_bar, text="📋  Copy", command=_copy_log).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(btn_bar, text="🗑  Clear", command=_clear_log).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(btn_bar, text="Close", command=_on_close).pack(side=tk.RIGHT)
+    win.protocol("WM_DELETE_WINDOW", _on_close)
+
+    _aix_render_logs(app)
+
+# Backward-compatible alias (older code may still call this name).
+def _aix_show_compress_log(app):
+    _aix_show_logs(app)
+    try:
+        app._aix_logs_filter_var.set("COMPRESS")
+        _set_sig_dirty(app)
+        _aix_render_logs(app)
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # DEBUG WINDOW - Test OCR engines on individual files

@@ -1266,6 +1266,32 @@ class OCRWorkerMixin:
 
     def _extract_receiving_report_fields(self, pdf_path: str) -> Dict:
         pages = self._collect_receiving_report_pages(pdf_path)
+        return self._parse_receiving_report_pages(pages)
+
+    def _extract_receiving_report_fields_from_text(self, text: str) -> Dict:
+        """Fast path: parse receiving-report fields straight from text that has
+        ALREADY been OCR'd (e.g. OCR.space output) without re-opening the PDF or
+        running local OCR again. Used by the AI Extract / API auto-ingest flow.
+
+        This is what makes API extraction fast: the previous code called
+        _collect_receiving_report_pages(), which re-rendered every page and ran
+        local OCR twice per page (header + full) at the configured scale - and it
+        was invoked twice per file. Here we reuse the OCR.space text instead.
+        """
+        raw = text or ""
+        # Use form-feed page breaks if the extractor provided them, else 1 page.
+        chunks = raw.split("\f") if "\f" in raw else [raw]
+        pages: List[Dict] = []
+        for i, chunk in enumerate(chunks):
+            up = chunk.upper()
+            if up.strip():
+                pages.append({"index": i, "text": up, "native_text": up})
+        # Mirror offline behaviour: prefer pages detected as receiving reports,
+        # but fall back to all pages if the detector matches none (OCR variance).
+        rr_pages = [p for p in pages if self._is_receiving_report_text(p["text"])]
+        return self._parse_receiving_report_pages(rr_pages if rr_pages else pages)
+
+    def _parse_receiving_report_pages(self, pages: List[Dict]) -> Dict:
         all_nums: List[int] = []
         best_date = ""
         best_po = ""
@@ -2050,12 +2076,13 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
         if getattr(self, "_aix_running", False) or self._worker_running or self._dispatch_running:
             return
         try:
-            from aiextracttab import _aix_start_process, _aix_send_to_tabs
+            from aiextracttab import _aix_start_process, _aix_send_to_tabs, _aix_log
         except Exception as e:
             logging.error(f"[AUTO-INGEST API] Could not import AI Extract functions: {e}", exc_info=True)
             self._set_status(f"[AUTO-INGEST API] AI Extract unavailable: {e}", ERROR)
             return
 
+        _aix_log(self, "SYSTEM", "Auto-ingest (API) triggered by folder watcher.")
         # Arm the one-shot completion hook so results are sent to the tabs
         # automatically once OCR.space processing finishes.
         self._aix_on_complete = lambda: _aix_send_to_tabs(self, auto=True)
