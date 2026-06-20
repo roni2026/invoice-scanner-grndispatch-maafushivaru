@@ -284,7 +284,13 @@ class OCRSpaceExtractor:
             if t:
                 texts.append(t)
 
-        return "\n".join(texts), ""
+        # Join pages with a form-feed (\f) instead of a newline so the
+        # downstream parser can tell the pages apart. A single PDF may contain
+        # several Receiving Reports (one per page); keeping the page boundaries
+        # lets the app (a) recover the supplier from a second report when the
+        # first is unreadable, and (b) SUM the invoice totals of every report
+        # instead of collapsing equal amounts together.
+        return "\f".join(texts), ""
 
 
 class AISupplierMatcher:

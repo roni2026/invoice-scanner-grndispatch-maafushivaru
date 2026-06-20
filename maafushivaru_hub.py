@@ -2229,16 +2229,20 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
         if getattr(self, "_aix_running", False) or self._worker_running or self._dispatch_running:
             return
         try:
-            from aiextracttab import _aix_start_process, _aix_send_to_tabs, _aix_log
+            from aiextracttab import _aix_start_process, _aix_log, _aix_maybe_prompt_sheet
         except Exception as e:
             logging.error(f"[AUTO-INGEST API] Could not import AI Extract functions: {e}", exc_info=True)
             self._set_status(f"[AUTO-INGEST API] AI Extract unavailable: {e}", ERROR)
             return
 
         _aix_log(self, "SYSTEM", "Auto-ingest (API) triggered by folder watcher.")
-        # Arm the one-shot completion hook so results are sent to the tabs
-        # automatically once OCR.space processing finishes.
-        self._aix_on_complete = lambda: _aix_send_to_tabs(self, auto=True)
+        # In API mode we ONLY extract and ACCUMULATE results in the AI Extract
+        # result tree - we do NOT auto-push them to the OCR Renamer / GRN
+        # Dispatch tabs. The user reviews / edits / renames in the result tree
+        # first, then clicks "Send to Tabs" manually. Results persist across
+        # tab switches and further auto-ingests until the user presses "Clear".
+        # The one-shot hook only offers to generate the sheet at the 30 mark.
+        self._aix_on_complete = lambda: _aix_maybe_prompt_sheet(self)
         _aix_start_process(self, auto=True)
 
     def _on_watcher_offline_toggle(self):
@@ -4844,6 +4848,14 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
         self._set_status(f"Corrected: {vals[1]}", ACCENT2)
         self._refresh_dashboard_stats()
         self._sync_rename_to_dispatch(result)
+        # Mirror the correction back to the AI Extract result tree too.
+        self._sync_to_ai_extract(
+            result.get("doc_id", ""),
+            result.get("supplier", ""),
+            result.get("grn", ""),
+            result.get("invoice", ""),
+            result.get("file", ""),
+        )
 
         if col_index == 2 and old_supplier != sup:
             self.after(300, lambda: self._offer_save_alias(old_supplier, sup))
@@ -5103,6 +5115,16 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
 
         if result:
             self._sync_dispatch_to_rename(result)
+            # Recolour the row (a corrected supplier is no longer "unknown")
+            # and mirror the edit back to the AI Extract result tree.
+            self._refresh_dispatch_row_tag(row_id)
+            self._sync_to_ai_extract(
+                result.get("doc_id", ""),
+                result.get("supplier", ""),
+                result.get("grn", ""),
+                result.get("invoice", ""),
+                result.get("file", ""),
+            )
 
         self._set_status("Dispatch cell updated. Re-export to Excel to save changes.")
 
@@ -5169,15 +5191,87 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
                 cell.font = font
                 cell.alignment = align
 
+        # Each manual export makes a BRAND-NEW file - never overwrite. The
+        # timestamp normally guarantees uniqueness; the counter covers the
+        # rare case of two exports within the same second.
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = os.path.join(self.dirs["base"], f"GRN_OUTPUT_{ts}.xlsx")
+        _cnt = 1
+        while os.path.exists(out):
+            out = os.path.join(self.dirs["base"], f"GRN_OUTPUT_{ts}_{_cnt}.xlsx")
+            _cnt += 1
         wb.save(out)
 
         self._set_status(f"Excel exported: {out}", SUCCESS)
-        self._notify("Maafushivaru — Export Complete", f"GRN_OUTPUT_{ts}.xlsx saved.")
+        self._notify("Maafushivaru — Export Complete", f"{os.path.basename(out)} saved.")
 
         if messagebox.askyesno("Export Successful", f"Saved:\n{out}\n\nOpen now?"):
             os.startfile(out)
+
+    def _write_grn_excel(self, rows: List[Dict]) -> str:
+        """Write GRN rows (list of result dicts) to a BRAND-NEW timestamped
+        Excel file and return its path. Shared by the AI Extract "Export Excel"
+        button and the 30-result "generate sheet now?" prompt. Never overwrites
+        an existing file."""
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "GRN Data"
+
+        headers = [
+            "INVOICE DATE", "SUPPLIER NAME", "PURCHASE ORDER #", "INVOICE #",
+            "USD", "MVR", "EUR", "GBP", "SGD", "GRN NO."
+        ]
+        ws.append(headers)
+
+        CURRENCY_COLS = {5: "E", 6: "F", 7: "G", 8: "H", 9: "I"}
+
+        for r in rows:
+            inv = r.get("invoice", "")
+            if isinstance(inv, str) and inv.upper() == "NO-INVOICE":
+                inv = ""
+            row_data = [
+                r.get("date", ""),
+                r.get("supplier", "") or "UNKNOWN SUPPLIER",
+                r.get("po", "") or "MAM-0000",
+                inv,
+                r.get("usd", ""),
+                r.get("mvr", ""),
+                r.get("eur", ""),
+                r.get("gbp", ""),
+                r.get("sgd", ""),
+                r.get("grn", "") or "RC-MAM-0000",
+            ]
+            ws.append(row_data)
+            rn = ws.max_row
+            for ci, cl in CURRENCY_COLS.items():
+                cell = ws[f"{cl}{rn}"]
+                val = row_data[ci - 1]
+                if val not in ("", None):
+                    try:
+                        cell.value = float(str(val).replace(",", ""))
+                        cell.number_format = NUMBER_FMT
+                    except (ValueError, TypeError):
+                        cell.value = val
+                else:
+                    cell.value = ""
+
+        font = Font(name="Arial Narrow", size=10)
+        align = Alignment(horizontal="center", vertical="center")
+        for col, w in zip("ABCDEFGHIJ", [14, 35, 18, 22, 12, 12, 12, 12, 12, 60]):
+            ws.column_dimensions[col].width = w
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.font = font
+                cell.alignment = align
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = os.path.join(self.dirs["base"], f"GRN_OUTPUT_{ts}.xlsx")
+        _cnt = 1
+        while os.path.exists(out):
+            out = os.path.join(self.dirs["base"], f"GRN_OUTPUT_{ts}_{_cnt}.xlsx")
+            _cnt += 1
+        wb.save(out)
+        return out
 
     # ------------------------------------------------------------------
     # VALIDATE GRN
@@ -5730,6 +5824,59 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
             "grn": new_grn,
             "raw_path": rename_result.get("dest_path", dispatch_result.get("raw_path", "")),
         })
+
+    def _sync_to_ai_extract(self, doc_id: str, supplier: str, grn: str,
+                            invoice_raw: str, file_name: str):
+        """Propagate an edit made on the OCR Renamer / GRN Dispatch tab back to
+        the matching row in the AI Extract result tree, so all three tabs stay
+        consistent (e.g. an "UNKNOWN SUPPLIER" row corrected in Dispatch is no
+        longer shown as unknown in AI Extract either)."""
+        tree = getattr(self, "_aix_tree", None)
+        row_map = getattr(self, "_aix_row_map", None)
+        if tree is None or row_map is None or not doc_id:
+            return
+        for rid, res in list(row_map.items()):
+            if res.get("doc_id") != doc_id:
+                continue
+            res["supplier"] = supplier
+            res["grn"] = grn
+            res["invoice"] = invoice_raw
+            if file_name:
+                res["file"] = file_name
+            try:
+                vals = list(tree.item(rid, "values"))
+                if vals and len(vals) >= 12:
+                    if file_name:
+                        vals[0] = file_name
+                    vals[2] = supplier            # Supplier
+                    vals[5] = invoice_raw          # Invoice #
+                    vals[11] = grn                 # GRN
+                    tree.item(rid, values=vals)
+            except Exception:
+                pass
+            break
+
+    def _refresh_dispatch_row_tag(self, row_id: str):
+        """Recompute the colour tag of a GRN Dispatch row after an inline edit
+        so a corrected supplier no longer shows the orange 'unknown' colour."""
+        result = self._dispatch_row_map.get(row_id)
+        if not result:
+            return
+        conf = result.get("confidence", 0.0)
+        conf_thr = self.cfg.get("app_settings", {}).get("confidence_warn_threshold", 80)
+        sup = (result.get("supplier", "") or "").upper()
+        if not result.get("is_valid", True):
+            tag = "invalid"
+        elif sup == "UNKNOWN SUPPLIER" or not sup:
+            tag = "unknown"
+        elif conf and conf < conf_thr:
+            tag = "low_conf"
+        else:
+            tag = "valid"
+        try:
+            self._dispatch_tree.item(row_id, tags=(tag,))
+        except Exception:
+            pass
 
     def _sync_dispatch_to_rename(self, dispatch_result: Dict):
         doc_id = dispatch_result.get("doc_id", "")

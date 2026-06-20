@@ -65,6 +65,11 @@ def _page_is_receiving_report(page_text: str) -> bool:
 # ---------------------------------------------------------------------------
 _OCR_FREE_MONTHLY_QUOTA = 2500
 
+# After this many results accumulate in the AI Extract result tree, the app
+# offers to generate (export) the Excel sheet. Re-offered at every further
+# multiple (60, 90, ...). Reset when the user presses "Clear".
+_AIX_SHEET_PROMPT_EVERY = 30
+
 
 def _aix_usage_file_path(app) -> str:
     return os.path.join(app.dirs.get("base", "."), "ocr_usage.json")
@@ -257,6 +262,8 @@ def add_ai_extract_tab(app):
     app._aix_logs = []               # unified log store (compress/api/process/send)
     app._aix_logs_window = None
     app._aix_logs_text = None
+    # Next result count at which the "generate sheet now?" dialog should fire.
+    app._aix_next_sheet_prompt = _AIX_SHEET_PROMPT_EVERY
 
     frame = app._make_tab("AI Extract")
     frame.configure(style="TFrame")
@@ -292,6 +299,12 @@ def add_ai_extract_tab(app):
         ctrl_bar,
         text="🗑  Clear",
         command=lambda: _aix_clear(app),
+    ).pack(side=tk.LEFT, padx=4, pady=8)
+
+    ttk.Button(
+        ctrl_bar,
+        text="📊  Export Excel",
+        command=lambda: _aix_export_excel(app),
     ).pack(side=tk.LEFT, padx=4, pady=8)
 
     ttk.Button(
@@ -628,6 +641,30 @@ def _aix_start_process(app, auto=False):
         messagebox.showwarning("AI Extract", "SCANNED folder is empty. Nothing to process.")
         return
 
+    # Results are PERSISTENT and ACCUMULATE across runs (manual or auto-ingest);
+    # they are only wiped when the user presses "Clear". Because the originals
+    # stay in SCANNED until "Send to Tabs" is clicked, skip any file we have
+    # already extracted so re-runs (and the folder watcher) never duplicate rows.
+    _already = {
+        os.path.basename(r.get("raw_path", "") or r.get("file", ""))
+        for r in app._aix_results
+    }
+    files = [f for f in files if os.path.basename(f) not in _already]
+    if not files:
+        msg = "AI Extract: no new PDFs (all already in the result tree)."
+        _aix_set_api_status(app, msg, MUTED)
+        app._set_status(msg, MUTED)
+        if auto:
+            # Still fire the completion hook (e.g. the sheet-generation prompt).
+            _cb = getattr(app, "_aix_on_complete", None)
+            app._aix_on_complete = None
+            if callable(_cb):
+                try:
+                    _cb()
+                except Exception as e:
+                    logging.error(f"[AI EXTRACT] on-complete hook failed: {e}", exc_info=True)
+        return
+
     used_this_month = _aix_get_usage_this_month(app)
     remaining = _OCR_FREE_MONTHLY_QUOTA - used_this_month
     if remaining <= 0:
@@ -662,13 +699,9 @@ def _aix_start_process(app, auto=False):
     app._set_status("AI Extract: preparing & OCR.space processing started...", ACCENT)
     _aix_set_api_status(app, "Preparing files...", ACCENT)
 
-    # Fresh run — clear old AI Extract rows so re-running Process doesn't
-    # pile up duplicates for files that are still sitting in SCANNED
-    app._aix_results = []
-    app._aix_row_map.clear()
-    app._aix_all_rows.clear()
-    for i in app._aix_tree.get_children():
-        app._aix_tree.delete(i)
+    # NOTE: we intentionally do NOT clear app._aix_results / the result tree
+    # here. Results persist and accumulate until the user presses "Clear".
+    # Duplicate processing is prevented by the skip-set built above.
 
     ocr_cfg = dict(app.cfg.get("ocr_space", {}))
     _engine_label = getattr(app, "_aix_ocr_engine_var", None)
@@ -860,27 +893,26 @@ def _aix_extract_supplier_raw(app, text: str) -> str:
     """
     Extract supplier name from OCR text.
 
-    Handles multi-line OCR splits such as:
-        VILLA HAKATHA
-        SUPPLIER: PRIVATE LIMITED
+    A single PDF may contain MORE THAN ONE Receiving Report (one per page).
+    OCR.space returns those pages separated by a form-feed ("\f"). The supplier
+    name is usually printed on every report, so if it is unreadable on one
+    report we can still recover it from another ("if one is not visible try to
+    grab from the other one").
 
     Strategy:
-      Pass 1 - look at the line before, the SUPPLIER: line, and the line
-               after; build candidate strings; normalize company-suffix
-               variants; match against config supplier list (no aliases).
-      Pass 2 - simple inline pattern fallback.
+      1. Try to match a KNOWN config supplier in the WHOLE text, then in each
+         individual page/report block.
+      2. If still nothing, fall back to a simple inline pattern on the whole
+         text and then on each block.
     """
     if not text:
         return ""
-
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     # ------------------------------------------------------------------
     # Build canonical supplier name list from config (no aliases)
     # ------------------------------------------------------------------
     suppliers_cfg = app.cfg.get("suppliers", [])
     supplier_names = []
-
     if isinstance(suppliers_cfg, list):
         supplier_names = [str(n).upper() for n in suppliers_cfg if n]
     elif isinstance(suppliers_cfg, dict):
@@ -900,107 +932,114 @@ def _aix_extract_supplier_raw(app, text: str) -> str:
         v = re.sub(r"\s+",                      " ",       v)
         return v.strip()
 
-    # Pre-normalise all config names once
     norm_supplier_names = [_norm(s) for s in supplier_names]
 
     # ------------------------------------------------------------------
-    # Pass 1 - multi-line context matching around the SUPPLIER: label
+    # Match a known config supplier inside ONE block of text.
     # ------------------------------------------------------------------
-    for idx, line in enumerate(lines):
-        if not re.search(r"\bSUPPLIER\b", line, re.IGNORECASE):
-            continue
+    def _match_known(block: str) -> str:
+        if not block:
+            return ""
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
 
-        line_before = lines[idx - 1]          if idx > 0               else ""
-        line_after  = lines[idx + 1]          if idx + 1 < len(lines)  else ""
+        for idx, line in enumerate(lines):
+            if not re.search(r"\bSUPPLIER\b", line, re.IGNORECASE):
+                continue
 
-        # Value written on the same line after the SUPPLIER: / VENDOR: label
-        m_inline = re.search(
-            r"\b(?:SUPPLIER(?:\s+NAME)?|VENDOR)\s*[:\-]\s*(.+)",
-            line,
-            re.IGNORECASE,
-        )
-        same_val = m_inline.group(1).strip() if m_inline else ""
+            line_before = lines[idx - 1] if idx > 0 else ""
+            line_after  = lines[idx + 1] if idx + 1 < len(lines) else ""
 
-        # Build all candidate strings for this SUPPLIER: occurrence
-        candidates = []
+            m_inline = re.search(
+                r"\b(?:SUPPLIER(?:\s+NAME)?|VENDOR)\s*[:\-]\s*(.+)",
+                line,
+                re.IGNORECASE,
+            )
+            same_val = m_inline.group(1).strip() if m_inline else ""
 
-        # Most common split case:  line_before = "VILLA HAKATHA"
-        #                          same_val     = "PRIVATE LIMITED"
-        if line_before and same_val:
-            candidates.append(f"{line_before} {same_val}")
+            candidates = []
+            if line_before and same_val:
+                candidates.append(f"{line_before} {same_val}")
+            if same_val:
+                candidates.append(same_val)
+            if same_val and line_after:
+                candidates.append(f"{same_val} {line_after}")
+            if line_before:
+                candidates.append(line_before)
+            if line_after:
+                candidates.append(line_after)
+            if line_before and same_val and line_after:
+                candidates.append(f"{line_before} {same_val} {line_after}")
 
-        # Whole name on the same line:  SUPPLIER: VILLA HAKATHA PVT LTD
-        if same_val:
-            candidates.append(same_val)
-
-        # Split the other way:  same_val = "VILLA HAKATHA"
-        #                        line_after = "PRIVATE LIMITED"
-        if same_val and line_after:
-            candidates.append(f"{same_val} {line_after}")
-
-        # Entire name sits on line_before
-        if line_before:
-            candidates.append(line_before)
-
-        # Entire name sits on line_after
-        if line_after:
-            candidates.append(line_after)
-
-        # Wide sweep: all three pieces combined
-        if line_before and same_val and line_after:
-            candidates.append(f"{line_before} {same_val} {line_after}")
-
-        # --- Exact / substring match (normalised) ---
-        for cand in candidates:
-            nc = _norm(cand)
-            for i, ns in enumerate(norm_supplier_names):
-                if ns in nc or nc in ns:
-                    return supplier_names[i]   # return canonical config name
-
-        # --- Fuzzy match via rapidfuzz (if available) ---
-        try:
-            from rapidfuzz import process as rf_proc, fuzz as rf_fuzz
-
+            # Exact / substring match (normalised)
             for cand in candidates:
                 nc = _norm(cand)
-                result = rf_proc.extractOne(
-                    nc,
-                    norm_supplier_names,
-                    scorer=rf_fuzz.token_sort_ratio,
-                    score_cutoff=75,
-                )
-                if result:
-                    matched_norm = result[0]
-                    try:
-                        matched_idx = norm_supplier_names.index(matched_norm)
-                        return supplier_names[matched_idx]
-                    except ValueError:
-                        pass
-        except Exception:
-            pass
+                for i, ns in enumerate(norm_supplier_names):
+                    if ns and (ns in nc or nc in ns):
+                        return supplier_names[i]
+
+            # Fuzzy match via rapidfuzz (if available)
+            try:
+                from rapidfuzz import process as rf_proc, fuzz as rf_fuzz
+                for cand in candidates:
+                    nc = _norm(cand)
+                    result = rf_proc.extractOne(
+                        nc,
+                        norm_supplier_names,
+                        scorer=rf_fuzz.token_sort_ratio,
+                        score_cutoff=75,
+                    )
+                    if result:
+                        try:
+                            return supplier_names[norm_supplier_names.index(result[0])]
+                        except ValueError:
+                            pass
+            except Exception:
+                pass
+        return ""
 
     # ------------------------------------------------------------------
-    # Pass 2 - simple inline pattern fallback
+    # Simple inline pattern fallback inside ONE block of text.
     # ------------------------------------------------------------------
-    patterns = [
-        r"SUPPLIER\s*[:\-]\s*(.+)",
-        r"VENDOR\s*[:\-]\s*(.+)",
-        r"SUPPLIER\s+NAME\s*[:\-]\s*(.+)",
-    ]
+    def _inline_fallback(block: str) -> str:
+        if not block:
+            return ""
+        patterns = [
+            r"SUPPLIER\s*[:\-]\s*(.+)",
+            r"VENDOR\s*[:\-]\s*(.+)",
+            r"SUPPLIER\s+NAME\s*[:\-]\s*(.+)",
+        ]
+        for line in [ln.strip() for ln in block.splitlines() if ln.strip()]:
+            for pat in patterns:
+                m = re.search(pat, line, re.IGNORECASE)
+                if m:
+                    value = m.group(1).strip()
+                    value = re.split(
+                        r"\s{2,}|(?:INVOICE|DATE|GRN|RC[-\s]*MAM|PO|PURCHASE\s+ORDER)\s*[:\-]?",
+                        value,
+                        maxsplit=1,
+                        flags=re.IGNORECASE,
+                    )[0].strip(" :-")
+                    if value:
+                        return value.upper()
+        return ""
 
-    for line in lines:
-        for pat in patterns:
-            m = re.search(pat, line, re.IGNORECASE)
-            if m:
-                value = m.group(1).strip()
-                value = re.split(
-                    r"\s{2,}|(?:INVOICE|DATE|GRN|RC[-\s]*MAM|PO|PURCHASE\s+ORDER)\s*[:\-]?",
-                    value,
-                    maxsplit=1,
-                    flags=re.IGNORECASE,
-                )[0].strip(" :-")
-                if value:
-                    return value.upper()
+    # ------------------------------------------------------------------
+    # Try the whole text first, then each report/page block. This is what
+    # makes a 2-receiving-report PDF behave like a normal one: the supplier
+    # is recovered from whichever report it is readable on.
+    # ------------------------------------------------------------------
+    blocks = [b for b in text.split("\f") if b.strip()]
+    search_order = [text] + blocks if len(blocks) > 1 else [text]
+
+    for blk in search_order:
+        hit = _match_known(blk)
+        if hit:
+            return hit
+
+    for blk in search_order:
+        fb = _inline_fallback(blk)
+        if fb:
+            return fb
 
     return ""
 
@@ -1028,7 +1067,21 @@ def _aix_send_to_tabs(app, auto=False):
     n_renamed = 0
     n_missing = 0
 
-    for result in app._aix_results:
+    # Iterate in the EXACT order shown in the result tree so the OCR Renamer
+    # and GRN Dispatch tabs end up sorted identically to the AI Extract tree.
+    ordered = []
+    for _rid in app._aix_tree.get_children():
+        _r = app._aix_row_map.get(_rid)
+        if _r is not None:
+            ordered.append(_r)
+    if not ordered:
+        ordered = list(app._aix_results)
+
+    for result in ordered:
+        # Skip rows already pushed to the tabs so re-clicking "Send to Tabs"
+        # (after more files were auto-ingested) never double-adds them.
+        if result.get("sent"):
+            continue
         fname = result.get("file", "")
         supplier = (result.get("supplier") or "UNKNOWN SUPPLIER").strip().upper()
         grn = (result.get("grn") or "RC-MAM-0000").strip().upper()
@@ -1090,6 +1143,9 @@ def _aix_send_to_tabs(app, auto=False):
         dispatch_result["raw_path"] = dest
         app._dispatch_results.append(dispatch_result)
         app._add_dispatch_tree_row(dispatch_result)
+
+        # Mark this AI Extract result as already dispatched.
+        result["sent"] = True
 
     app._refresh_dashboard_stats()
     _aix_log(app, "SEND", f"Sent to tabs - {n_renamed} renamed, {n_missing} missing.")
@@ -1254,7 +1310,64 @@ def _aix_clear(app):
     app._aix_all_rows.clear()
     for i in app._aix_tree.get_children():
         app._aix_tree.delete(i)
-    app._set_status("AI Extract results cleared.")
+    # Reset the "generate sheet now?" milestone.
+    app._aix_next_sheet_prompt = _AIX_SHEET_PROMPT_EVERY
+    # Clearing AI Extract also clears the OCR Renamer and GRN Dispatch tabs.
+    try:
+        app._clear_rename_results()
+    except Exception as e:
+        logging.error(f"[AI EXTRACT] clear rename failed: {e}", exc_info=True)
+    try:
+        app._clear_dispatch_results()
+    except Exception as e:
+        logging.error(f"[AI EXTRACT] clear dispatch failed: {e}", exc_info=True)
+    app._set_status("Cleared AI Extract, OCR Renamer and GRN Dispatch results.")
+
+
+def _aix_export_excel(app):
+    """Export the CURRENT AI Extract results to a brand-new Excel sheet.
+    Each call writes a new timestamped GRN_OUTPUT_*.xlsx (never overwrites)."""
+    if not app._aix_results:
+        messagebox.showwarning("AI Extract", "No results to export. Run 'Process' first.")
+        return
+    # Use the live tree order so the sheet matches what the user sees.
+    rows = []
+    for rid in app._aix_tree.get_children():
+        r = app._aix_row_map.get(rid)
+        if r:
+            rows.append(r)
+    if not rows:
+        rows = list(app._aix_results)
+    try:
+        out = app._write_grn_excel(rows)
+    except Exception as e:
+        logging.error(f"[AI EXTRACT] Excel export failed: {e}", exc_info=True)
+        messagebox.showerror("Export Failed", f"Could not export Excel:\n\n{e}")
+        return
+    _aix_log(app, "SYSTEM", f"Excel exported ({len(rows)} rows) -> {os.path.basename(out)}")
+    app._set_status(f"Excel exported: {out}", SUCCESS)
+    app._notify("Maafushivaru — Export Complete", f"{os.path.basename(out)} saved ({len(rows)} rows).")
+    try:
+        if messagebox.askyesno("Export Successful", f"Saved:\n{out}\n\nOpen now?"):
+            os.startfile(out)
+    except Exception:
+        pass
+
+
+def _aix_maybe_prompt_sheet(app):
+    """When the result tree reaches a 30-result milestone, offer to generate
+    the Excel sheet now. Re-offered at 60, 90, ... and reset on Clear."""
+    n = len(app._aix_results)
+    nxt = getattr(app, "_aix_next_sheet_prompt", _AIX_SHEET_PROMPT_EVERY)
+    if n < nxt:
+        return
+    # Advance to the next milestone so we don't re-prompt for the same batch.
+    app._aix_next_sheet_prompt = ((n // _AIX_SHEET_PROMPT_EVERY) + 1) * _AIX_SHEET_PROMPT_EVERY
+    if messagebox.askyesno(
+        "AI Extract",
+        f"{n} PDF processed.\n\nGenerate sheet now?",
+    ):
+        _aix_export_excel(app)
     
 # ---------------------------------------------------------------------------
 # COMPRESS LOG VIEWER
@@ -1740,6 +1853,12 @@ def _aix_poll_queue(app):
                         cb()
                     except Exception as e:
                         logging.error(f"[AI EXTRACT] on-complete hook failed: {e}", exc_info=True)
+                else:
+                    # Manual run finished -> offer the sheet at the 30 milestone.
+                    try:
+                        _aix_maybe_prompt_sheet(app)
+                    except Exception as e:
+                        logging.error(f"[AI EXTRACT] sheet prompt failed: {e}", exc_info=True)
                 return
 
             kind, data = item
