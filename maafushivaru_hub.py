@@ -285,6 +285,111 @@ def _clean_invoice_token(token: str) -> str:
     return t
 
 
+# ---------------------------------------------------------------------------
+# OCR ROBUSTNESS HELPERS
+#   - fuzzy label detection (handles staple holes / smudged characters)
+#   - digit confusion fixing for RC-MAM GRN numbers
+#   - invoice series-prefix correction for underline misreads (I -> L / 1)
+# ---------------------------------------------------------------------------
+
+# Letters most commonly produced when an underline merges with a digit's glyph,
+# mapped back to the digit they should be. Applied ONLY to the numeric region
+# of an RC-MAM code, never to the 'RC'/'MAM' prefix.
+_OCR_DIGIT_FIX = str.maketrans({
+    "O": "0", "Q": "0", "D": "0",
+    "I": "1", "L": "1", "|": "1", "!": "1",
+    "Z": "2",
+    "E": "3",
+    "A": "4",
+    "S": "5",
+    "G": "6",
+    "T": "7", "J": "7",
+    "B": "8",
+})
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Plain edit distance for short tokens (label words)."""
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * lb
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[lb]
+
+
+def _label_present(text: str, label: str, max_dist: int = 2) -> bool:
+    """True if every word of `label` appears (in order, consecutively) inside
+    `text`, allowing up to `max_dist` single-character OCR errors per word.
+
+    This is what lets the app still recognise 'RECEIVING RECORD' when a staple
+    hole or smudge makes one or more characters unreadable, e.g. 'RECEIVING
+    RECORO', 'RECE1VING RECORD', 'RECEIVNG RECORD'.
+    """
+    words = re.findall(r"[A-Z0-9]+", (text or "").upper())
+    label_words = label.upper().split()
+    n = len(label_words)
+    W = len(words)
+    if n == 0 or W == 0:
+        return False
+
+    def _word_ok(w: str, lw: str) -> bool:
+        return abs(len(w) - len(lw)) <= 1 and _levenshtein(w, lw) <= max_dist
+
+    # Match label words in order. Each label word may match a single input word
+    # OR two adjacent input words joined together - this covers staple holes that
+    # split a word in two (e.g. 'RECEIV NG' -> 'RECEIVING').
+    for start in range(W):
+        wi = start
+        ok = True
+        for lw in label_words:
+            if wi >= W:
+                ok = False
+                break
+            if _word_ok(words[wi], lw):
+                wi += 1
+            elif wi + 1 < W and _word_ok(words[wi] + words[wi + 1], lw):
+                wi += 2
+            else:
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+def _fix_invoice_prefix(token: str, fixes: dict) -> str:
+    """Correct an OCR-misread invoice *series prefix* using a config map.
+
+    Underlined invoice codes like 'MSI-282910' are frequently read as
+    'MSL-282910' (the underline turns the 'I' into an 'L') or 'MS1-282910'.
+    `fixes` maps the wrong prefix to the right one, e.g. {'MSL': 'MSI'}.
+    Only the leading alphabetic/numeric prefix before the first separator is
+    touched, so the digits and everything else are preserved exactly.
+    """
+    if not token or not fixes:
+        return token
+    t = token.strip()
+    m = re.match(r"^([A-Z0-9]{2,6})([\-/ ].*)?$", t.upper())
+    if not m:
+        return t
+    prefix = m.group(1)
+    rest = m.group(2) or ""
+    fixed = fixes.get(prefix)
+    if fixed:
+        return fixed + rest
+    return t
+
+
 def _build_unique_word_index(suppliers: list, aliases: dict) -> dict:
     from collections import Counter
     all_cands = list(suppliers)
@@ -1032,11 +1137,20 @@ class OCRWorkerMixin:
     # ------------- RECEIVING REPORT / GRN / PO / DATE -------------
     def _is_receiving_report_text(self, text: str) -> bool:
         u = (text or "").upper()
-        return (
+        if (
             "RECEIVING REPORT" in u
             or "RECEIVING RECORD" in u
             or ("RECEIVING" in u and "RECORD" in u)
-        )
+        ):
+            return True
+        # Tolerant fallback for OCR-damaged labels (staple holes, smudges) where
+        # one or more characters of the label are unreadable.
+        if self.cfg.get("app_settings", {}).get("receiving_label_fuzzy", True):
+            return (
+                _label_present(u, "RECEIVING RECORD", max_dist=2)
+                or _label_present(u, "RECEIVING REPORT", max_dist=2)
+            )
+        return False
 
     def _collect_receiving_report_pages(self, pdf_path: str) -> List[Dict]:
         pages = []
@@ -1232,7 +1346,38 @@ class OCRWorkerMixin:
                 if d:
                     nums.append(int(d))
 
+        # Tolerant fallback: if the gated passes above found nothing (e.g. the
+        # 'RECEIVING RECORD' label was damaged by a staple hole, or a digit in
+        # the code was misread as a letter), scan the whole text for an RC-MAM
+        # token with OCR-confusion repair on the numeric part.
+        if not nums:
+            nums.extend(self._extract_rcmam_tolerant(u))
+
         return sorted(set(nums))
+
+    def _extract_rcmam_tolerant(self, text: str) -> List[int]:
+        """Best-effort RC-MAM number recovery that tolerates OCR damage.
+
+        Finds 'RC...MAM' (allowing common prefix confusions) and repairs the
+        following number region by mapping look-alike letters back to digits
+        (O->0, I/L->1, S->5, B->8, ...). Used only as a fallback so it never
+        overrides a clean match.
+        """
+        out: List[int] = []
+        u = (text or "").upper()
+        for m in re.finditer(r"R[C0G6]\s*[-\s]?\s*M[A4]M", u):
+            tail = u[m.end(): m.end() + 18]
+            tail = re.sub(r"^[\s:\-#.]+", "", tail)
+            region = tail[:14]
+            # Stop the number region at a clear word break (2+ spaces) or a
+            # following field label, so we don't slurp unrelated characters.
+            region = re.split(r"\s{2,}|PURCHASE|\bPO\b|P\.O", region)[0]
+            fixed = region.translate(_OCR_DIGIT_FIX)
+            digits = re.sub(r"\D", "", fixed)
+            d = self._reconstruct_rcmam_digits(digits)
+            if d:
+                out.append(int(d))
+        return out
 
     def _extract_grn_from_filename_old(self, p):
         base = os.path.splitext(os.path.basename(p))[0].upper()
@@ -1375,6 +1520,7 @@ class OCRWorkerMixin:
                                 if m:
                                     v = _clean_invoice_token(m.group(1))
                                     if v:
+                                        v = _fix_invoice_prefix(v, self.cfg.get("invoice_prefix_fixes", {}))
                                         return v.replace("/", " ").replace("\\", " ").strip()
                             except re.error:
                                 pass
@@ -1383,6 +1529,7 @@ class OCRWorkerMixin:
         v = _find_invoice_value(raw)
         v = _clean_invoice_token(v) if v else ""
         if v:
+            v = _fix_invoice_prefix(v, self.cfg.get("invoice_prefix_fixes", {}))
             return v.replace("/", " ").replace("\\", " ").strip()
         return None
 
@@ -1826,6 +1973,10 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
             },
             "suppliers": [],
             "aliases": {},
+            "invoice_prefix_fixes": {
+                "MSL": "MSI",
+                "MS1": "MSI"
+            },
             "patterns": {
                 "grn_prefix": "RC-MAM-",
                 "grn_digits": 9,
@@ -1842,6 +1993,8 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
                 "auto_ingest_watcher": False,
                 "auto_ingest_offline": False,
                 "auto_ingest_api": False,
+                "receiving_label_fuzzy": True,
+                "delete_temp_after_send": True,
                 "confidence_warn_threshold": 80,
                 "page_scan_region_enabled": False,
                 "page_scan_region_percent": 100,
@@ -5440,6 +5593,113 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
             if data.get("doc_id") == doc_id:
                 return row_id, data
         return None, None
+
+    def _apply_ai_extract_edit(self, ai_result: Dict) -> bool:
+        """Propagate an edit made on the AI Extract tab to the OCR Renamer and
+        GRN Dispatch tabs, and rename the file on disk to match.
+
+        Only acts if this document has ALREADY been sent to the tabs (matched by
+        doc_id). Returns True if it propagated, False if there was nothing to do.
+        """
+        doc_id = ai_result.get("doc_id", "")
+        if not doc_id:
+            return False
+        r_row, rename_result = self._find_rename_row_by_doc_id(doc_id)
+        if not r_row or not rename_result:
+            return False  # not sent to tabs yet -> nothing to update
+
+        supplier = (ai_result.get("supplier") or "UNKNOWN SUPPLIER").strip().upper()
+        grn = (ai_result.get("grn") or "RC-MAM-0000").strip().upper()
+        inv_raw = (ai_result.get("invoice") or "").strip()
+        inv_internal = "" if (not inv_raw or inv_raw.upper() == "NO-INVOICE") else inv_raw
+
+        # --- Rename the renamed file on disk to reflect the edit ---
+        dp = rename_result.get("dest_path", "")
+        if dp and os.path.exists(dp):
+            fn_inv = f"IN {inv_internal}" if inv_internal else "NO-INVOICE"
+            nd = os.path.join(
+                os.path.dirname(dp),
+                self._safe_filename(f"{supplier} GRN {grn} {fn_inv}.pdf"),
+            )
+            if os.path.abspath(nd) != os.path.abspath(dp):
+                base, ext = os.path.splitext(nd)
+                cnt = 1
+                while os.path.exists(nd):
+                    nd = f"{base}_{cnt}{ext}"
+                    cnt += 1
+                try:
+                    shutil.move(dp, nd)
+                    rename_result["dest_path"] = nd
+                except Exception as e:
+                    logging.error(f"[AI EDIT] rename failed: {e}", exc_info=True)
+                    messagebox.showerror("Rename Failed", f"Could not rename file:\n\n{e}")
+                    return False
+
+        new_name = os.path.basename(rename_result.get("dest_path", "")) or rename_result.get("file", "")
+        rename_result.update({
+            "file": new_name,
+            "new_name": new_name,
+            "supplier": supplier,
+            "grn": grn,
+            "invoice": inv_internal,
+            "invoice_dispatch": inv_internal,
+            "date": ai_result.get("date", rename_result.get("date", "")),
+            "po": ai_result.get("po", "") or "MAM-0000",
+            "usd": ai_result.get("usd", ""),
+            "mvr": ai_result.get("mvr", ""),
+            "eur": ai_result.get("eur", ""),
+            "gbp": ai_result.get("gbp", ""),
+            "sgd": ai_result.get("sgd", ""),
+            "status": "corrected",
+        })
+
+        # --- Update OCR Renamer tree row ---
+        # rename columns: 0 file, 1 new_name, 2 supplier, 3 conf, 4 grn,
+        #                 5 invoice, 6 status, 7 dupe
+        vals = list(self._rename_tree.item(r_row, "values"))
+        if vals:
+            inv_disp = f"IN {inv_internal}" if inv_internal else "NO-INVOICE"
+            vals[0] = new_name
+            vals[1] = new_name
+            vals[2] = supplier
+            vals[4] = grn
+            vals[5] = inv_disp
+            if len(vals) > 6:
+                vals[6] = "corrected"
+            self._rename_tree.item(r_row, values=vals, tags=("corrected",))
+            self._rename_tree.tag_configure("corrected", foreground=ACCENT2)
+
+        # --- Propagate to GRN Dispatch (file/supplier/invoice/grn) ---
+        self._sync_rename_to_dispatch(rename_result)
+
+        # --- Also push date / PO / currency totals to the dispatch row ---
+        # dispatch columns: 0 file,1 date,2 supplier,3 conf,4 po,5 invoice,
+        #                   6 usd,7 mvr,8 eur,9 gbp,10 sgd,11 grn
+        d_row, dispatch_result = self._find_dispatch_row_by_doc_id(doc_id)
+        if d_row and dispatch_result:
+            dvals = list(self._dispatch_tree.item(d_row, "values"))
+            if dvals and len(dvals) >= 12:
+                dvals[1] = rename_result["date"]
+                dvals[4] = rename_result["po"]
+                dvals[6] = rename_result["usd"]
+                dvals[7] = rename_result["mvr"]
+                dvals[8] = rename_result["eur"]
+                dvals[9] = rename_result["gbp"]
+                dvals[10] = rename_result["sgd"]
+                self._dispatch_tree.item(d_row, values=dvals)
+            dispatch_result.update({
+                "date": rename_result["date"],
+                "po": rename_result["po"],
+                "usd": rename_result["usd"],
+                "mvr": rename_result["mvr"],
+                "eur": rename_result["eur"],
+                "gbp": rename_result["gbp"],
+                "sgd": rename_result["sgd"],
+            })
+
+        self._refresh_dashboard_stats()
+        logging.info(f"[AI EDIT] Propagated edit + rename for doc {doc_id} -> {new_name}")
+        return True
 
     def _sync_rename_to_dispatch(self, rename_result: Dict):
         doc_id = rename_result.get("doc_id", "")

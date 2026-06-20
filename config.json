@@ -1,5 +1,9 @@
 {
     "tesseract_cmd": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+    "invoice_prefix_fixes": {
+        "MSL": "MSI",
+        "MS1": "MSI"
+    },
     "app_settings": {
         "ocr_engine": "tesseract",
         "ocr_fallback_to_tesseract": true,
@@ -21,6 +25,8 @@
         "auto_ingest_watcher": false,
         "auto_ingest_offline": false,
         "auto_ingest_api": false,
+        "receiving_label_fuzzy": true,
+        "delete_temp_after_send": true,
         "confidence_warn_threshold": 80,
         "page_scan_region_enabled": false,
         "page_scan_region_percent": 100,

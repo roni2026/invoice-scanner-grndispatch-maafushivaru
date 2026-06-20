@@ -1097,6 +1097,12 @@ def _aix_send_to_tabs(app, auto=False):
         f"Sent to tabs - {n_renamed} renamed, {n_missing} missing.",
         SUCCESS if n_missing == 0 else WARNING,
     )
+
+    # Processing is complete and originals are renamed -> clear the temporary
+    # OCR upload copies from TEMP API PDFS.
+    if n_renamed > 0:
+        _aix_cleanup_temp(app)
+
     if auto:
         app._notify(
             "Maafushivaru - Auto-Ingest (API) Complete",
@@ -1107,6 +1113,29 @@ def _aix_send_to_tabs(app, auto=False):
         "Send to Tabs",
         f"Done.\n\nRenamed: {n_renamed}\nMissing originals: {n_missing}\n\nCheck the OCR Renamer and GRN Dispatch tabs.",
     )
+
+
+def _aix_cleanup_temp(app):
+    """Delete every PDF in the TEMP API PDFS folder once processing is complete
+    and the originals have been renamed/dispatched. Originals in SCANNED and
+    PROCESSED are never touched. Controlled by the 'delete_temp_after_send'
+    setting (default on)."""
+    if not app.cfg.get("app_settings", {}).get("delete_temp_after_send", True):
+        return
+    temp = getattr(app, "_aix_temp_folder", "")
+    if not temp or not os.path.isdir(temp):
+        return
+    removed = 0
+    for fn in os.listdir(temp):
+        if fn.lower().endswith(".pdf"):
+            try:
+                os.remove(os.path.join(temp, fn))
+                removed += 1
+            except Exception as e:
+                logging.warning(f"[AI EXTRACT] Could not delete temp PDF {fn}: {e}")
+    if removed:
+        _aix_log(app, "SYSTEM", f"TEMP API PDFS cleaned - deleted {removed} temp PDF(s) after send.")
+        app._set_status(f"TEMP API PDFS cleaned ({removed} file(s) removed).", SUCCESS)
 
 
 # ---------------------------------------------------------------------------
@@ -1189,7 +1218,34 @@ def _aix_on_tree_edit(app, row_id, col_index, old_val, new_val):
         if col_index < len(keys) and keys[col_index] != "_conf":
             result[keys[col_index]] = new_val
 
-    app._set_status("AI Extract cell updated.")
+        # If this document was already sent to the OCR Renamer / GRN Dispatch
+        # tabs, propagate the edit there and rename the file on disk to match.
+        propagated = False
+        try:
+            propagated = app._apply_ai_extract_edit(result)
+        except Exception as e:
+            logging.error(f"[AI EXTRACT] propagate edit failed: {e}", exc_info=True)
+
+        if propagated:
+            # Reflect the (possibly) renamed file back in the AI Extract row too.
+            try:
+                rid, rr = app._find_rename_row_by_doc_id(result.get("doc_id", ""))
+                if rr and rr.get("file"):
+                    result["file"] = rr["file"]
+                    rvals = list(app._aix_tree.item(row_id, "values"))
+                    rvals[0] = rr["file"]
+                    app._aix_tree.item(row_id, values=rvals)
+            except Exception:
+                pass
+            _aix_log(app, "SEND",
+                     f"Edit synced to tabs: {result.get('file','')} "
+                     f"(supplier={result.get('supplier','')}, grn={result.get('grn','')}, "
+                     f"invoice={result.get('invoice','') or '-'})")
+            app._set_status("AI Extract edit applied + synced to OCR Renamer / GRN Dispatch.", SUCCESS)
+        else:
+            app._set_status("AI Extract cell updated.")
+    else:
+        app._set_status("AI Extract cell updated.")
 
 
 def _aix_clear(app):
