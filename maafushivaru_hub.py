@@ -1353,7 +1353,9 @@ class OCRWorkerMixin:
         if not nums:
             nums.extend(self._extract_rcmam_tolerant(u))
 
-        return sorted(set(nums))
+        # Preserve the order the numbers appear in the document (do NOT sort) so
+        # the GRN chain reflects which Receiving Record comes first on the page.
+        return list(dict.fromkeys(nums))
 
     def _extract_rcmam_tolerant(self, text: str) -> List[int]:
         """Best-effort RC-MAM number recovery that tolerates OCR damage.
@@ -1390,7 +1392,9 @@ class OCRWorkerMixin:
         pats = self.cfg.get("patterns", {})
         prefix = pats.get("grn_prefix", "RC-MAM-")
         target_len = int(pats.get("grn_digits", 9))
-        nums = sorted(set(nums))
+        # Keep document order (first-seen first); only drop duplicates. Example:
+        # a PDF showing 19891 then 19890 -> RC-MAM-000019891-19890.
+        nums = list(dict.fromkeys(nums))
         first = str(nums[0]).zfill(target_len)
         if len(nums) == 1:
             return f"{prefix}{first}"
@@ -2457,23 +2461,24 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 0))
 
+        # Tab order: Dashboard -> Scan -> OCR Renamer -> GRN Dispatch ->
+        #            AI Extract -> Settings -> About
         self._build_dashboard_tab()
-        self._build_renamer_tab()
-        self._build_dispatch_tab()
-        self._build_settings_tab()
-        self._build_about_tab()
-
         try:
             from scan_tab import add_scan_tab
             add_scan_tab(self)
         except Exception as e:
             logging.error(f"Scan tab failed to load: {e}")
+        self._build_renamer_tab()
+        self._build_dispatch_tab()
         try:
             from aiextracttab import add_ai_extract_tab
             add_ai_extract_tab(self)
         except Exception as e:
             logging.error(f"AI Extract tab failed to load: {e}", exc_info=True)
             messagebox.showerror("AI Extract Tab Load Error", str(e))
+        self._build_settings_tab()
+        self._build_about_tab()
 
         self._process_buttons = [
             getattr(self, "_btn_start_rename",   None),
@@ -2703,6 +2708,8 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
         ttk.Button(row, text="📂  Open PROCESSED", command=lambda: self._open_folder(self.dirs["processed"])).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="📂  Open FAILED",    command=lambda: self._open_folder(self.dirs["failed"])).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="📋  Open Logs",      command=lambda: self._open_folder(self.dirs["logs"])).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="📦  Transfer Processed Pdf", style="Accent.TButton",
+                   command=self._transfer_processed_pdfs).pack(side=tk.LEFT, padx=4)
 
         # Directories
         info = self._section(frame, "System Directories")
@@ -2711,7 +2718,113 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
             r.pack(fill=tk.X, padx=20, pady=3)
             tk.Label(r, text=f"{k.upper()}:", bg=PANEL, fg=MUTED, font=("Segoe UI", 9, "bold"), width=12, anchor="w").pack(side=tk.LEFT)
             tk.Label(r, text=self.dirs.get(k, ""), bg=PANEL, fg=ACCENT, font=("Segoe UI", 9)).pack(side=tk.LEFT)
+
+        # --- Processed Pdf Transfer destination (editable + persistent) ---
+        tr = tk.Frame(info, bg=PANEL)
+        tr.pack(fill=tk.X, padx=20, pady=(8, 3))
+        tk.Label(tr, text="PROCESSED PDF TRANSFER:", bg=PANEL, fg=MUTED,
+                 font=("Segoe UI", 9, "bold"), width=24, anchor="w").pack(side=tk.LEFT)
+        self._processed_transfer_var = tk.StringVar(
+            value=self.cfg.get("app_settings", {}).get("processed_transfer_path", "")
+        )
+        _tr_entry = tk.Entry(
+            tr, textvariable=self._processed_transfer_var,
+            bg=PANEL2, fg=TEXT, insertbackground=TEXT, relief="flat",
+            font=("Segoe UI", 9), bd=0, highlightthickness=1,
+            highlightbackground=PANEL3, highlightcolor=ACCENT, width=52,
+        )
+        _tr_entry.pack(side=tk.LEFT, ipady=3, padx=(0, 6))
+        # Persist when the user finishes editing (focus out / Enter).
+        _tr_entry.bind("<FocusOut>", lambda _e: self._save_transfer_path())
+        _tr_entry.bind("<Return>",   lambda _e: self._save_transfer_path())
+        ttk.Button(tr, text="Browse", command=self._browse_transfer_path).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(tr, text="Save",   command=self._save_transfer_path).pack(side=tk.LEFT)
+
         tk.Frame(info, bg=PANEL).pack(pady=8)
+
+    # ------------------------------------------------------------------
+    # PROCESSED PDF TRANSFER
+    # ------------------------------------------------------------------
+    def _save_transfer_path(self):
+        """Persist the 'Processed Pdf Transfer' destination to config."""
+        path = (self._processed_transfer_var.get() or "").strip()
+        self.cfg.setdefault("app_settings", {})["processed_transfer_path"] = path
+        try:
+            self._save_config()
+            self._set_status(f"Processed Pdf Transfer path saved: {path or '(empty)'}", SUCCESS)
+        except Exception as e:
+            logging.error(f"Could not save transfer path: {e}", exc_info=True)
+            self._set_status(f"Could not save transfer path: {e}", ERROR)
+
+    def _browse_transfer_path(self):
+        start = (self._processed_transfer_var.get() or "").strip() or self.dirs.get("processed", "")
+        chosen = filedialog.askdirectory(initialdir=start or self.dirs.get("base", ""))
+        if chosen:
+            self._processed_transfer_var.set(chosen)
+            self._save_transfer_path()
+
+    def _transfer_processed_pdfs(self):
+        """Move every PDF from the PROCESSED folder to the user-defined
+        'Processed Pdf Transfer' destination."""
+        dest = (self._processed_transfer_var.get() or "").strip()
+        if not dest:
+            messagebox.showwarning(
+                "Transfer Processed Pdf",
+                "Set a 'Processed Pdf Transfer' destination path on the Dashboard first.",
+            )
+            return
+
+        src = self.dirs.get("processed", "")
+        if not src or not os.path.isdir(src):
+            messagebox.showerror("Transfer Processed Pdf", f"PROCESSED folder not found:\n{src}")
+            return
+
+        try:
+            os.makedirs(dest, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("Transfer Processed Pdf", f"Could not create destination:\n{dest}\n\n{e}")
+            return
+
+        if os.path.abspath(dest) == os.path.abspath(src):
+            messagebox.showwarning("Transfer Processed Pdf", "Destination is the same as the PROCESSED folder.")
+            return
+
+        pdfs = [f for f in os.listdir(src) if f.lower().endswith(".pdf")]
+        if not pdfs:
+            messagebox.showinfo("Transfer Processed Pdf", "No processed PDFs to transfer.")
+            return
+
+        if not messagebox.askyesno(
+            "Transfer Processed Pdf",
+            f"Move {len(pdfs)} processed PDF(s) to:\n{dest}?",
+        ):
+            return
+
+        moved, failed = 0, 0
+        for fn in pdfs:
+            s = os.path.join(src, fn)
+            d = os.path.join(dest, fn)
+            base, ext = os.path.splitext(d)
+            cnt = 1
+            while os.path.exists(d):
+                d = f"{base}_{cnt}{ext}"
+                cnt += 1
+            try:
+                shutil.move(s, d)
+                moved += 1
+            except Exception as e:
+                failed += 1
+                logging.error(f"Transfer failed for {fn}: {e}", exc_info=True)
+
+        self._refresh_dashboard_stats()
+        self._set_status(
+            f"Transferred {moved} PDF(s) to {dest} ({failed} failed).",
+            SUCCESS if failed == 0 else WARNING,
+        )
+        messagebox.showinfo(
+            "Transfer Processed Pdf",
+            f"Done.\n\nMoved: {moved}\nFailed: {failed}\nDestination:\n{dest}",
+        )
 
     # ------------------------------------------------------------------
     # OCR RENAMER TAB

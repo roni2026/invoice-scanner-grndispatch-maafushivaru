@@ -63,7 +63,7 @@ def _page_is_receiving_report(page_text: str) -> bool:
 # ---------------------------------------------------------------------------
 # OCR.SPACE USAGE / CREDIT TRACKING  (1 request = 1 page, 2500 free / month)
 # ---------------------------------------------------------------------------
-_OCR_FREE_MONTHLY_QUOTA = 2500
+_OCR_FREE_MONTHLY_QUOTA = 25000
 
 # After this many results accumulate in the AI Extract result tree, the app
 # offers to generate (export) the Excel sheet. Re-offered at every further
@@ -147,6 +147,8 @@ def _aix_set_api_status(app, text: str, color=None):
 # UNIFIED LOGS  (Compress / API / Process / Send / System in one window)
 # ---------------------------------------------------------------------------
 _AIX_LOG_CATEGORIES = ["COMPRESS", "API", "PROCESS", "SEND", "SYSTEM"]
+# Special pseudo-category in the Logs window that reveals a per-PDF dropdown.
+_AIX_PDF_LOG_LABEL = "PDF Log"
 _AIX_LOG_MAX = 5000
 
 def _aix_log(app, category: str, message: str):
@@ -262,6 +264,10 @@ def add_ai_extract_tab(app):
     app._aix_logs = []               # unified log store (compress/api/process/send)
     app._aix_logs_window = None
     app._aix_logs_text = None
+    # Per-PDF debug store (raw OCR text + parsed fields), shown in the "PDF Log"
+    # view of the Logs window. Temporary - wiped on Clear.
+    if not hasattr(app, "_aix_pdf_logs"):
+        app._aix_pdf_logs = {}
     # Next result count at which the "generate sheet now?" dialog should fire.
     app._aix_next_sheet_prompt = _AIX_SHEET_PROMPT_EVERY
 
@@ -418,6 +424,16 @@ def add_ai_extract_tab(app):
         fg=MUTED,
         font=("Segoe UI", 8),
     ).pack(side=tk.LEFT, padx=8, pady=(12, 4))
+
+    # Live count of how many PDFs are currently in the result tree.
+    app._aix_count_var = tk.StringVar(value="0 PDFs in results")
+    tk.Label(
+        hdr_bar,
+        textvariable=app._aix_count_var,
+        bg=PANEL,
+        fg=ACCENT,
+        font=("Segoe UI", 9, "bold"),
+    ).pack(side=tk.RIGHT, padx=20, pady=(12, 4))
 
     tf = tk.Frame(frame, bg=PANEL)
     tf.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
@@ -809,6 +825,10 @@ def _aix_start_process(app, auto=False):
                     "scan_index": idx,
                     "was_modified": was_modified,
                     "pages_used": n_pages,
+                    # Stashed for the "PDF Log" view (moved to app._aix_pdf_logs
+                    # on the main thread by the queue poller).
+                    "raw_ocr_text": text,
+                    "parsed_fields": dict(fields),
                 }
 
                 if err == "":
@@ -1029,17 +1049,43 @@ def _aix_extract_supplier_raw(app, text: str) -> str:
     # is recovered from whichever report it is readable on.
     # ------------------------------------------------------------------
     blocks = [b for b in text.split("\f") if b.strip()]
-    search_order = [text] + blocks if len(blocks) > 1 else [text]
 
-    for blk in search_order:
-        hit = _match_known(blk)
-        if hit:
-            return hit
+    # --- Single Receiving Record: match on the whole text. ---
+    if len(blocks) <= 1:
+        return _match_known(text) or _inline_fallback(text) or ""
 
-    for blk in search_order:
-        fb = _inline_fallback(blk)
-        if fb:
-            return fb
+    # --- Multiple Receiving Records in ONE pdf ---
+    # Every GRN document starts with "RECEIVING RECORD". A pdf can hold several,
+    # each (ideally) naming the supplier. Sometimes the supplier on the FIRST
+    # record is unreadable while a LATER record on the same pdf shows it. Two
+    # records that share the SAME invoice number belong to the same supplier,
+    # so we can safely borrow the name from the readable record.
+    per = []  # (supplier, invoice) per record block, in document order
+    for b in blocks:
+        sup = _match_known(b) or _inline_fallback(b)
+        try:
+            inv = (app._extract_invoice(b) or "").strip().upper()
+        except Exception:
+            inv = ""
+        per.append((sup, inv))
+
+    # 1) First record already names the supplier -> use it.
+    if per[0][0]:
+        return per[0][0]
+
+    # 2) First record has no supplier: borrow it from another record on the
+    #    same pdf that shares the same invoice number (same supplier).
+    first_inv = per[0][1]
+    if first_inv:
+        for sup, inv in per[1:]:
+            if sup and inv and inv == first_inv:
+                return sup
+
+    # 3) Otherwise take the supplier from the first record that names one
+    #    (document order - earliest GRN wins).
+    for sup, _inv in per:
+        if sup:
+            return sup
 
     return ""
 
@@ -1245,6 +1291,20 @@ def _aix_add_row(app, result: Dict):
     )
     app._aix_row_map[row_id] = result
     app._aix_all_rows.append(row_id)
+    _aix_update_count(app)
+
+
+def _aix_update_count(app):
+    """Refresh the 'N PDFs in results' label in the AI Extract header."""
+    var = getattr(app, "_aix_count_var", None)
+    if var is None:
+        return
+    try:
+        n = len(app._aix_tree.get_children())
+    except Exception:
+        n = len(getattr(app, "_aix_results", []) or [])
+    var.set(f"{n} PDF{'' if n == 1 else 's'} in results")
+
 
 def _aix_on_tree_edit(app, row_id, col_index, old_val, new_val):
     vals = list(app._aix_tree.item(row_id, "values"))
@@ -1321,7 +1381,20 @@ def _aix_clear(app):
         app._clear_dispatch_results()
     except Exception as e:
         logging.error(f"[AI EXTRACT] clear dispatch failed: {e}", exc_info=True)
-    app._set_status("Cleared AI Extract, OCR Renamer and GRN Dispatch results.")
+    # Also wipe ALL logs (unified log store, compress buffer and per-PDF logs).
+    app._aix_logs = []
+    if getattr(app, "_aix_compress_log", None) is not None:
+        app._aix_compress_log.clear()
+    if getattr(app, "_aix_pdf_logs", None) is not None:
+        app._aix_pdf_logs.clear()
+    # Force the Logs window (if open) to redraw and refresh the PDF dropdown.
+    app._aix_logs_last_sig = None
+    try:
+        _aix_refresh_pdf_log_combo(app)
+    except Exception:
+        pass
+    _aix_update_count(app)
+    app._set_status("Cleared AI Extract, OCR Renamer, GRN Dispatch results and all logs.")
 
 
 def _aix_export_excel(app):
@@ -1363,11 +1436,14 @@ def _aix_maybe_prompt_sheet(app):
         return
     # Advance to the next milestone so we don't re-prompt for the same batch.
     app._aix_next_sheet_prompt = ((n // _AIX_SHEET_PROMPT_EVERY) + 1) * _AIX_SHEET_PROMPT_EVERY
-    if messagebox.askyesno(
+    # Informational only - no export button here. The user generates the sheet
+    # whenever they like with the "Export Excel" button on the AI Extract tab.
+    messagebox.showinfo(
         "AI Extract",
-        f"{n} PDF processed.\n\nGenerate sheet now?",
-    ):
-        _aix_export_excel(app)
+        f"{n} PDFs have been processed and are ready in the results.\n\n"
+        f"You can generate the Excel sheet now — just click "
+        f"\"📊 Export Excel\" on the AI Extract tab whenever you're ready.",
+    )
     
 # ---------------------------------------------------------------------------
 # COMPRESS LOG VIEWER
@@ -1391,6 +1467,32 @@ def _aix_render_logs(app):
     flt = getattr(app, "_aix_logs_filter_var", None)
     selected = flt.get() if flt else "ALL"
 
+    # ---- PDF Log view: show one selected PDF's extracted data + fields ----
+    if selected == _AIX_PDF_LOG_LABEL:
+        pdf_logs = getattr(app, "_aix_pdf_logs", {}) or {}
+        pdf_name = ""
+        pv = getattr(app, "_aix_pdf_log_var", None)
+        if pv is not None:
+            pdf_name = pv.get()
+        sig = ("PDFLOG", pdf_name, len(pdf_logs))
+        if getattr(app, "_aix_logs_last_sig", None) == sig:
+            app._aix_logs_after_id = win.after(800, lambda: _aix_render_logs(app))
+            return
+        app._aix_logs_last_sig = sig
+
+        txt.configure(state="normal")
+        txt.delete("1.0", tk.END)
+        if not pdf_logs:
+            txt.insert("1.0", "No PDF logs yet. Run 'Process' first.")
+        elif not pdf_name or pdf_name not in pdf_logs:
+            txt.insert("1.0", "Select a PDF from the dropdown above to view its log.")
+        else:
+            txt.insert(tk.END, _aix_format_pdf_log(pdf_name, pdf_logs[pdf_name]))
+        txt.configure(state="disabled")
+        txt.see("1.0")
+        app._aix_logs_after_id = win.after(800, lambda: _aix_render_logs(app))
+        return
+
     logs = getattr(app, "_aix_logs", []) or []
     if selected and selected != "ALL":
         logs = [e for e in logs if e.get("cat") == selected]
@@ -1411,6 +1513,61 @@ def _aix_render_logs(app):
     txt.configure(state="disabled")
     txt.see(tk.END)
     app._aix_logs_after_id = win.after(800, lambda: _aix_render_logs(app))
+
+
+def _aix_format_pdf_log(pdf_name: str, info: dict) -> str:
+    """Build the debug-style text block for a single PDF's stored log."""
+    fields = info.get("fields", {}) or {}
+    raw = info.get("raw", "") or ""
+    err = info.get("err", "") or ""
+    lines = [
+        f"File           : {pdf_name}",
+        f"Pages          : {info.get('pages', '')}",
+        f"OCR Error      : {err or 'None'}",
+        "",
+        "--- Extracted Fields ---",
+        f"Supplier       : {fields.get('supplier', '')}",
+        f"Confidence     : {fields.get('confidence', 0.0):.1f}%",
+        f"GRN            : {fields.get('grn', '')}",
+        f"PO #           : {fields.get('po', '')}",
+        f"Invoice #      : {fields.get('invoice', '')}",
+        f"Date           : {fields.get('date', '')}",
+        "",
+        "--- Totals ---",
+        f"USD            : {fields.get('usd', '')}",
+        f"MVR            : {fields.get('mvr', '')}",
+        f"EUR            : {fields.get('eur', '')}",
+        f"GBP            : {fields.get('gbp', '')}",
+        f"SGD            : {fields.get('sgd', '')}",
+        "",
+        "--- Raw OCR Stats ---",
+        f"Char count     : {len(raw)}",
+        f"Line count     : {len(raw.splitlines())}",
+        "",
+        "--- Raw OCR Text ---",
+        raw or "(no text returned)",
+    ]
+    return "\n".join(lines)
+
+
+def _aix_refresh_pdf_log_combo(app):
+    """Repopulate the PDF dropdown in the Logs window from the per-PDF store."""
+    combo = getattr(app, "_aix_pdf_log_combo", None)
+    if combo is None:
+        return
+    try:
+        if not combo.winfo_exists():
+            return
+    except Exception:
+        return
+    names = list((getattr(app, "_aix_pdf_logs", {}) or {}).keys())
+    combo["values"] = names
+    cur = app._aix_pdf_log_var.get() if getattr(app, "_aix_pdf_log_var", None) else ""
+    if names and cur not in names:
+        app._aix_pdf_log_var.set(names[0])
+    elif not names:
+        app._aix_pdf_log_var.set("")
+
 
 def _set_sig_dirty(app):
     app._aix_logs_last_sig = None
@@ -1447,10 +1604,41 @@ def _aix_show_logs(app):
              font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 6))
     app._aix_logs_filter_var = tk.StringVar(value="ALL")
     combo = ttk.Combobox(filt_bar, textvariable=app._aix_logs_filter_var,
-                         values=["ALL"] + _AIX_LOG_CATEGORIES, state="readonly",
-                         width=14, font=("Segoe UI", 9))
+                         values=["ALL"] + _AIX_LOG_CATEGORIES + [_AIX_PDF_LOG_LABEL],
+                         state="readonly", width=14, font=("Segoe UI", 9))
     combo.pack(side=tk.LEFT)
-    combo.bind("<<ComboboxSelected>>", lambda _e: (_set_sig_dirty(app), _aix_render_logs(app)))
+
+    # Second dropdown - only visible when "PDF Log" is chosen. Lets the user
+    # pick an individual PDF and see its extracted data + parsed fields.
+    app._aix_pdf_log_label = tk.Label(filt_bar, text="PDF:", bg=PANEL, fg=TEXT,
+                                      font=("Segoe UI", 9))
+    app._aix_pdf_log_var = tk.StringVar(value="")
+    app._aix_pdf_log_combo = ttk.Combobox(
+        filt_bar, textvariable=app._aix_pdf_log_var,
+        values=[], state="readonly", width=46, font=("Segoe UI", 9),
+    )
+    app._aix_pdf_log_combo.bind(
+        "<<ComboboxSelected>>", lambda _e: (_set_sig_dirty(app), _aix_render_logs(app))
+    )
+
+    def _on_filter_changed(_e=None):
+        if app._aix_logs_filter_var.get() == _AIX_PDF_LOG_LABEL:
+            _aix_refresh_pdf_log_combo(app)
+            app._aix_pdf_log_label.pack(side=tk.LEFT, padx=(14, 6))
+            app._aix_pdf_log_combo.pack(side=tk.LEFT)
+        else:
+            try:
+                app._aix_pdf_log_combo.pack_forget()
+                app._aix_pdf_log_label.pack_forget()
+            except Exception:
+                pass
+        _set_sig_dirty(app)
+        _aix_render_logs(app)
+
+    combo.bind("<<ComboboxSelected>>", _on_filter_changed)
+    # Start hidden (default filter is ALL).
+    app._aix_pdf_log_combo.pack_forget()
+    app._aix_pdf_log_label.pack_forget()
 
     txt_frame = tk.Frame(win, bg=PANEL)
     txt_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
@@ -1865,6 +2053,20 @@ def _aix_poll_queue(app):
 
             if kind == "row":
                 app._aix_results.append(data)
+                # Record per-PDF debug info (raw OCR text + parsed fields) so it
+                # can be inspected later from the Logs window "PDF Log" view.
+                try:
+                    if not hasattr(app, "_aix_pdf_logs"):
+                        app._aix_pdf_logs = {}
+                    app._aix_pdf_logs[data.get("file", "")] = {
+                        "raw": data.get("raw_ocr_text", "") or "",
+                        "fields": data.get("parsed_fields", {}) or {},
+                        "err": data.get("errors", "") or "",
+                        "pages": data.get("pages_used", ""),
+                    }
+                    _aix_refresh_pdf_log_combo(app)
+                except Exception as e:
+                    logging.error(f"[AI EXTRACT] pdf-log store failed: {e}", exc_info=True)
                 _aix_add_row(app, data)
 
             elif kind == "progress":
