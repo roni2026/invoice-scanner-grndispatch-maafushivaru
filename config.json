@@ -19,6 +19,8 @@
         "dry_run": false,
         "desktop_notifications": true,
         "auto_ingest_watcher": false,
+        "auto_ingest_offline": false,
+        "auto_ingest_api": false,
         "confidence_warn_threshold": 80,
         "page_scan_region_enabled": false,
         "page_scan_region_percent": 100,

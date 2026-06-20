@@ -538,11 +538,24 @@ def _aix_write_trimmed_pdf(src_path: str, keep_indices: List[int], dest_path: st
 # ---------------------------------------------------------------------------
 # STEP 2: PROCESS VIA OCR.SPACE
 # ---------------------------------------------------------------------------
-def _aix_start_process(app):
+def _aix_start_process(app, auto=False):
+    """Run OCR.space extraction over every PDF in SCANNED.
+
+    auto=True  -> unattended mode used by the auto-ingest watcher:
+                  no blocking message boxes, and on completion the results
+                  are pushed straight to the OCR Renamer / GRN Dispatch tabs
+                  via the `app._aix_on_complete` one-shot callback.
+    """
     if app._aix_running:
         return
 
     if not OCR_SPACE_AVAILABLE:
+        if auto:
+            app._set_status(
+                "[AUTO-INGEST API] OCR.space extractor unavailable - skipped.", ERROR
+            )
+            logging.error("[AUTO-INGEST API] OCRSpaceExtractor import failed; cannot process.")
+            return
         messagebox.showerror(
             "OCR.space Unavailable",
             "OCRSpaceExtractor could not be imported from ai_supplier_matcher.py.\n"
@@ -556,18 +569,36 @@ def _aix_start_process(app):
 
     files = app._get_pdf_files_strict_order(scanned)
     if not files:
+        if auto:
+            app._set_status("[AUTO-INGEST API] SCANNED empty - nothing to process.", WARNING)
+            return
         messagebox.showwarning("AI Extract", "SCANNED folder is empty. Nothing to process.")
         return
 
     used_this_month = _aix_get_usage_this_month(app)
     remaining = _OCR_FREE_MONTHLY_QUOTA - used_this_month
     if remaining <= 0:
-        if not messagebox.askyesno(
+        if auto:
+            logging.warning(
+                "[AUTO-INGEST API] Free OCR.space quota reached "
+                f"({used_this_month}/{_OCR_FREE_MONTHLY_QUOTA}); proceeding automatically."
+            )
+        elif not messagebox.askyesno(
             "OCR.space Free Quota Reached",
             f"You have already used {used_this_month} of your {_OCR_FREE_MONTHLY_QUOTA} "
             f"free OCR.space requests this month.\n\nContinue anyway?",
         ):
             return
+
+    # Compression threshold is driven by the configurable OCR.space upload limit
+    # (Settings -> OCR.space "Max upload MB"), defaulting to 1.0 MB. Files at or
+    # below this size are copied as-is; larger files are compressed first.
+    try:
+        target_mb = float(app.cfg.get("ocr_space", {}).get("max_upload_mb", 1.0))
+    except (TypeError, ValueError):
+        target_mb = 1.0
+    if target_mb <= 0:
+        target_mb = 1.0
 
     app._aix_running = True
     app._set_buttons_state("disabled")
@@ -619,7 +650,7 @@ def _aix_start_process(app):
                 else:
                     app._set_status(f"[AI EXTRACT] Preparing {fname} ({idx}/{total})", ACCENT)
                     try:
-                        was_modified = _aix_compress_pdf_to_size(src_path, temp_path, target_mb=1.0)
+                        was_modified = _aix_compress_pdf_to_size(src_path, temp_path, target_mb=target_mb)
                     except Exception as e:
                         logging.error(f"[AI EXTRACT] Prep failed [{fname}]: {e}", exc_info=True)
                         shutil.copy2(src_path, temp_path)
@@ -887,12 +918,17 @@ def _aix_extract_supplier_raw(app, text: str) -> str:
 # ---------------------------------------------------------------------------
 # STEP 3: SEND TO TABS
 # ---------------------------------------------------------------------------
-def _aix_send_to_tabs(app):
+def _aix_send_to_tabs(app, auto=False):
     if app._aix_running:
+        if auto:
+            return
         messagebox.showinfo("AI Extract", "Please wait for the current task to finish.")
         return
 
     if not app._aix_results:
+        if auto:
+            app._set_status("[AUTO-INGEST API] No results to send to tabs.", WARNING)
+            return
         messagebox.showwarning("AI Extract", "No results to send. Run 'Process' first.")
         return
 
@@ -970,6 +1006,12 @@ def _aix_send_to_tabs(app):
         f"Sent to tabs - {n_renamed} renamed, {n_missing} missing.",
         SUCCESS if n_missing == 0 else WARNING,
     )
+    if auto:
+        app._notify(
+            "Maafushivaru - Auto-Ingest (API) Complete",
+            f"{n_renamed} renamed and dispatched, {n_missing} missing.",
+        )
+        return
     messagebox.showinfo(
         "Send to Tabs",
         f"Done.\n\nRenamed: {n_renamed}\nMissing originals: {n_missing}\n\nCheck the OCR Renamer and GRN Dispatch tabs.",
@@ -1475,6 +1517,15 @@ def _aix_poll_queue(app):
             if item is None:
                 app._set_buttons_state("normal")
                 app._refresh_dashboard_stats()
+                # One-shot completion hook used by the auto-ingest API watcher
+                # to automatically push results to the tabs once OCR finishes.
+                cb = getattr(app, "_aix_on_complete", None)
+                app._aix_on_complete = None
+                if callable(cb):
+                    try:
+                        cb()
+                    except Exception as e:
+                        logging.error(f"[AI EXTRACT] on-complete hook failed: {e}", exc_info=True)
                 return
 
             kind, data = item

@@ -1739,9 +1739,18 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
         self._notify_var = tk.BooleanVar(
             value=self.cfg.get("app_settings", {}).get("desktop_notifications", True)
         )
-        self._watcher_var = tk.BooleanVar(
-            value=self.cfg.get("app_settings", {}).get("auto_ingest_watcher", False)
+        # Two mutually-exclusive auto-ingest modes (replace the legacy single
+        # "auto_ingest_watcher" flag):
+        #   offline -> OCR rename + GRN dispatch, fully local
+        #   api     -> AI Extract (OCR.space) with size-check + auto compress
+        self._watcher_offline_var = tk.BooleanVar(
+            value=self.cfg.get("app_settings", {}).get("auto_ingest_offline", False)
         )
+        self._watcher_api_var = tk.BooleanVar(
+            value=self.cfg.get("app_settings", {}).get("auto_ingest_api", False)
+        )
+        # One-shot hook the AI Extract poller calls when an auto run finishes.
+        self._aix_on_complete = None
         self._conf_threshold_var = tk.IntVar(
             value=self.cfg.get("app_settings", {}).get("confidence_warn_threshold", 80)
         )
@@ -1764,8 +1773,8 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
         self._refresh_engine_badge()
         self._refresh_dashboard_stats()
 
-        # Start watcher if it was enabled on last run
-        if self._watcher_var.get():
+        # Start watcher if either auto-ingest mode was enabled on last run
+        if self._watcher_offline_var.get() or self._watcher_api_var.get():
             self.after(500, self._start_watcher)
 
         # Poll watcher queue
@@ -1805,6 +1814,8 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
                 "dry_run": False,
                 "desktop_notifications": True,
                 "auto_ingest_watcher": False,
+                "auto_ingest_offline": False,
+                "auto_ingest_api": False,
                 "confidence_warn_threshold": 80,
                 "page_scan_region_enabled": False,
                 "page_scan_region_percent": 100,
@@ -1862,6 +1873,18 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
                     if subkey not in cfg[key]:
                         cfg[key][subkey] = subvalue
 
+        # --- Backward-compat migration -------------------------------------
+        # The old single "auto_ingest_watcher" flag is replaced by two
+        # explicit modes. If the legacy flag was on and neither new mode is
+        # set, default it to the OFFLINE pipeline (its previous behaviour).
+        s = cfg.setdefault("app_settings", {})
+        if s.get("auto_ingest_watcher") and not s.get("auto_ingest_offline") and not s.get("auto_ingest_api"):
+            s["auto_ingest_offline"] = True
+        # Safety: the two modes are mutually exclusive. If both somehow ended
+        # up enabled, API wins and offline is cleared.
+        if s.get("auto_ingest_offline") and s.get("auto_ingest_api"):
+            s["auto_ingest_offline"] = False
+
         return cfg
 
 
@@ -1917,13 +1940,15 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
                 "Watchdog Not Installed",
                 "Auto-ingest requires the watchdog library.\n\nInstall it with:\n  pip install watchdog"
             )
-            self._watcher_var.set(False)
+            self._watcher_offline_var.set(False)
+            self._watcher_api_var.set(False)
             return
 
         scanned = self.dirs.get("scanned", "")
         if not os.path.isdir(scanned):
             messagebox.showerror("Watcher Error", f"SCANNED folder not found:\n{scanned}")
-            self._watcher_var.set(False)
+            self._watcher_offline_var.set(False)
+            self._watcher_api_var.set(False)
             return
 
         if self._watcher_observer and self._watcher_observer.is_alive():
@@ -1940,9 +1965,13 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
         self._watcher_observer.schedule(adapter, scanned, recursive=False)
         self._watcher_observer.start()
 
-        self._watcher_badge_var.set("● AUTO-INGEST ON")
-        self._set_status(f"Auto-ingest watching: {scanned}")
-        logging.info(f"[WATCHER] Started watching {scanned}")
+        self._watcher_badge_var.set(f"● AUTO-INGEST: {self._active_ingest_mode().upper()}")
+        self._set_status(
+            f"Auto-ingest ({self._active_ingest_mode()}) watching: {scanned}"
+        )
+        logging.info(
+            f"[WATCHER] Started watching {scanned} in {self._active_ingest_mode()} mode"
+        )
 
     def _stop_watcher(self):
         if self._watcher_observer:
@@ -1955,26 +1984,124 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
         self._watcher_badge_var.set("")
         self._set_status("Auto-ingest stopped.")
 
+    def _active_ingest_mode(self) -> str:
+        """Return the currently selected auto-ingest mode: 'api', 'offline' or 'off'."""
+        if self._watcher_api_var.get():
+            return "api"
+        if self._watcher_offline_var.get():
+            return "offline"
+        return "off"
+
     def _poll_watcher_queue(self):
-        """Check for new files detected by watchdog, then trigger processing."""
+        """Check for new files detected by watchdog, then route to the active mode.
+
+        OFFLINE -> local OCR rename + GRN dispatch (_start_extract_and_process)
+        API     -> AI Extract (OCR.space): size-check, auto-compress >threshold,
+                   then auto send-to-tabs. Originals are never modified; they are
+                   only renamed when results are pushed to the tabs.
+        """
         try:
             while True:
                 pdf_path = self._watcher_queue.get_nowait()
-                if os.path.exists(pdf_path) and not self._worker_running:
-                    self._set_status(f"[AUTO-INGEST] Detected: {os.path.basename(pdf_path)} — processing...")
+                if not os.path.exists(pdf_path):
+                    continue
+
+                mode = self._active_ingest_mode()
+                busy = self._worker_running or self._dispatch_running or getattr(self, "_aix_running", False)
+                if busy:
+                    # A run is already in progress. Re-queue this file and try
+                    # again on the next poll so nothing is dropped.
+                    self._watcher_queue.put(pdf_path)
+                    break
+
+                fname = os.path.basename(pdf_path)
+                try:
+                    size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
+                except OSError:
+                    size_mb = 0.0
+
+                if mode == "api":
+                    self._set_status(
+                        f"[AUTO-INGEST API] Detected: {fname} ({size_mb:.2f} MB) — extracting...",
+                        ACCENT,
+                    )
+                    self.after(200, self._auto_ingest_api)
+                elif mode == "offline":
+                    self._set_status(
+                        f"[AUTO-INGEST OFFLINE] Detected: {fname} — processing...",
+                        ACCENT,
+                    )
                     self.after(200, self._start_extract_and_process)
+                # mode == "off": ignore (watcher should not be running, but be safe)
         except queue.Empty:
             pass
         self.after(1500, self._poll_watcher_queue)
 
-    def _on_watcher_toggle(self):
-        enabled = self._watcher_var.get()
-        self.cfg.setdefault("app_settings", {})["auto_ingest_watcher"] = enabled
-        self._save_config()
+    def _auto_ingest_api(self):
+        """Unattended AI Extract run for the API auto-ingest mode.
+
+        Delegates to the AI Extract tab's processor, which already:
+          - copies files <= the configured size limit untouched, and
+          - compresses larger files into TEMP API PDFS first,
+        always leaving the original SCANNED PDF untouched. When OCR finishes,
+        the one-shot _aix_on_complete hook auto-pushes results to the tabs,
+        which is where originals are renamed.
+        """
+        if getattr(self, "_aix_running", False) or self._worker_running or self._dispatch_running:
+            return
+        try:
+            from aiextracttab import _aix_start_process, _aix_send_to_tabs
+        except Exception as e:
+            logging.error(f"[AUTO-INGEST API] Could not import AI Extract functions: {e}", exc_info=True)
+            self._set_status(f"[AUTO-INGEST API] AI Extract unavailable: {e}", ERROR)
+            return
+
+        # Arm the one-shot completion hook so results are sent to the tabs
+        # automatically once OCR.space processing finishes.
+        self._aix_on_complete = lambda: _aix_send_to_tabs(self, auto=True)
+        _aix_start_process(self, auto=True)
+
+    def _on_watcher_offline_toggle(self):
+        enabled = self._watcher_offline_var.get()
         if enabled:
-            self._start_watcher()
+            # Mutually exclusive with API mode.
+            self._watcher_api_var.set(False)
+        self._persist_ingest_modes()
+        self._apply_watcher_state()
+
+    def _on_watcher_api_toggle(self):
+        enabled = self._watcher_api_var.get()
+        if enabled:
+            # Mutually exclusive with offline mode.
+            self._watcher_offline_var.set(False)
+        self._persist_ingest_modes()
+        self._apply_watcher_state()
+
+    def _persist_ingest_modes(self):
+        s = self.cfg.setdefault("app_settings", {})
+        s["auto_ingest_offline"] = bool(self._watcher_offline_var.get())
+        s["auto_ingest_api"] = bool(self._watcher_api_var.get())
+        # Keep the legacy key roughly in sync so older code/exports still work.
+        s["auto_ingest_watcher"] = s["auto_ingest_offline"] or s["auto_ingest_api"]
+        self._save_config()
+
+    def _apply_watcher_state(self):
+        """Start or stop the folder observer based on the active mode."""
+        if self._active_ingest_mode() != "off":
+            if self._watcher_observer and self._watcher_observer.is_alive():
+                # Already running — just refresh the badge to the new mode.
+                self._watcher_badge_var.set(f"● AUTO-INGEST: {self._active_ingest_mode().upper()}")
+                self._set_status(
+                    f"Auto-ingest mode set to {self._active_ingest_mode()}.", ACCENT
+                )
+            else:
+                self._start_watcher()
         else:
             self._stop_watcher()
+
+    # Backward-compat alias (kept in case other code references the old name).
+    def _on_watcher_toggle(self):
+        self._apply_watcher_state()
 
     # ------------------------------------------------------------------
     # QUEUE POLLING
@@ -2638,13 +2765,27 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
 
         ttk.Checkbutton(
             wf,
-            text="Enable Auto-Ingest — automatically process new PDFs dropped into SCANNED",
-            variable=self._watcher_var, command=self._on_watcher_toggle,
+            text="Enable Auto-Ingest (Offline) — new PDFs run local OCR Rename + GRN Dispatch",
+            variable=self._watcher_offline_var, command=self._on_watcher_offline_toggle,
+        ).pack(anchor="w", pady=4)
+        ttk.Checkbutton(
+            wf,
+            text="Enable Auto-Ingest (API) — new PDFs run AI Extract (OCR.space): "
+                 "auto size-check, compress if over the limit, then send to tabs",
+            variable=self._watcher_api_var, command=self._on_watcher_api_toggle,
         ).pack(anchor="w", pady=4)
         tk.Label(
             wf,
-            text="New files are debounced by 3 seconds to wait for the full copy to complete before processing.",
-            bg=PANEL, fg=MUTED, font=("Segoe UI", 9), wraplength=850,
+            text=(
+                "Choose ONE mode — the two are mutually exclusive so a file is never "
+                "processed twice. New files are debounced by 3 seconds to wait for the full "
+                "copy to finish.\n"
+                "• Offline: fully local OCR — no internet, no upload limit.\n"
+                "• API: files at or below the OCR.space upload limit are sent as-is; "
+                "larger files are compressed into 'TEMP API PDFS' first. The original PDF in "
+                "SCANNED is never modified — it is only renamed when results are sent to the tabs."
+            ),
+            bg=PANEL, fg=MUTED, font=("Segoe UI", 9), wraplength=850, justify="left",
         ).pack(anchor="w", pady=(0, 12))
 
         # Desktop notifications
@@ -3907,7 +4048,9 @@ class MaafushivaruHub(tk.Tk, OCRWorkerMixin):
         s["processing_mode"] = self._processing_mode_var.get()
         s["dry_run"] = bool(self._dry_run_var.get())
         s["desktop_notifications"] = bool(self._notify_var.get())
-        s["auto_ingest_watcher"] = bool(self._watcher_var.get())
+        s["auto_ingest_offline"] = bool(self._watcher_offline_var.get())
+        s["auto_ingest_api"] = bool(self._watcher_api_var.get())
+        s["auto_ingest_watcher"] = s["auto_ingest_offline"] or s["auto_ingest_api"]
         s["confidence_warn_threshold"] = int(self._conf_threshold_var.get())
         s["page_scan_region_enabled"] = bool(self._page_scan_enabled_var.get())
         s["page_scan_region_percent"] = int(self._page_scan_percent_var.get())
